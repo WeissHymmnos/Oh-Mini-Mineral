@@ -1,0 +1,52 @@
+object MainForm: TMainForm
+  Left = 140
+  Height = 640
+  Top = 110
+  Width = 980
+  BorderStyle = bsNone
+  Caption = 'Oh-Mini-Mineral — Classic Macintosh Audio Deck'
+  ClientHeight = 640
+  ClientWidth = 980
+  Color = 14540253
+  Constraints.MinHeight = 88
+  Constraints.MinWidth = 320
+  KeyPreview = True
+  Position = poScreenCenter
+  LCLVersion = '4.8'
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  OnKeyDown = FormKeyDown
+  OnKeyPress = FormKeyPress
+  OnResize = FormResize
+  object pbMac: TPaintBox
+    Left = 0
+    Height = 640
+    Top = 0
+    Width = 980
+    Align = alClient
+    OnDblClick = pbMacDblClick
+    OnMouseDown = pbMacMouseDown
+    OnMouseMove = pbMacMouseMove
+    OnMouseUp = pbMacMouseUp
+    OnMouseWheel = pbMacMouseWheel
+    OnPaint = pbMacPaint
+  end
+  object tmrSpectrum: TTimer
+    Interval = 33
+    OnTimer = tmrSpectrumTimer
+    Left = 24
+    Top = 580
+  end
+  object tmrStatus: TTimer
+    Interval = 120
+    OnTimer = tmrStatusTimer
+    Left = 72
+    Top = 580
+  end
+  object tmrIPC: TTimer
+    Interval = 50
+    OnTimer = tmrIPCTimer
+    Left = 120
+    Top = 580
+  end
+end

@@ -1,0 +1,22 @@
+[package]
+name = "omm-e2e-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Comprehensive End-to-End Test Suite for Oh-My-Mineral Core and Streaming Plugin"
+
+[workspace]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["alloc"] }
+tempfile = "3"
+memmap2 = "0.9"
+libc = "0.2"
+
+[[bin]]
+name = "omm-e2e"
+path = "src/main.rs"
+
+[lib]
+name = "omm_e2e_lib"
+path = "src/lib.rs"

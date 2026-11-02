@@ -1,0 +1,11 @@
+/bin/
+/dist/
+target/
+*.o
+*.ppu
+*.or
+*.compiled
+*.bak
+link*.res
+ppas.sh
+library.bin
