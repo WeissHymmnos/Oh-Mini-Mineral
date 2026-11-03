@@ -4,8 +4,10 @@ program omm_daemon;
 {$PACKRECORDS C}
 
 uses
-  cthreads, BaseUnix, Unix, SysUtils, Classes, Math,
-  omm_ipc, omm_shm, omm_codec_abi, omm_fft, omm_audio, omm_library, omm_watchdog, omm_router;
+  {$IFDEF UNIX}cthreads, BaseUnix, Unix,{$ENDIF}
+  {$IFDEF WINDOWS}Windows,{$ENDIF}
+  ctypes, SysUtils, Classes, Math,
+  omm_os, omm_ipc, omm_shm, omm_codec_abi, omm_fft, omm_audio, omm_library, omm_watchdog, omm_router;
 
 var
   GTerminated: Boolean = False;
@@ -15,11 +17,21 @@ var
   GLibraryFile: string = OMM_DEFAULT_LIBRARY_PATH;
   GPluginPath: string = PLUGIN_DEFAULT_LIB_PATH;
 
+{$IFDEF UNIX}
 procedure SigHandler(Sig: cint); cdecl;
 begin
   if (Sig = SIGINT) or (Sig = SIGTERM) then
     GTerminated := True;
 end;
+{$ENDIF}
+
+{$IFDEF WINDOWS}
+function WinCtrlHandler(dwCtrlType: DWORD): BOOL; stdcall;
+begin
+  GTerminated := True;
+  Result := True;
+end;
+{$ENDIF}
 
 procedure ParseCommandLine;
 var
@@ -92,7 +104,7 @@ var
   oldPid: TPid;
   existingShm: POMMSharedMemory;
 begin
-  pidFile := SocketPath + '.pid';
+  pidFile := NormalizeOmmPath(SocketPath + '.pid');
   if FileExists(pidFile) then
   begin
     sl := TStringList.Create;
@@ -118,7 +130,7 @@ begin
 
   sl := TStringList.Create;
   try
-    pidStr := IntToStr(fpGetPID);
+    pidStr := IntToStr(FpGetpid);
     sl.Text := pidStr;
     try
       sl.SaveToFile(pidFile);
@@ -131,11 +143,14 @@ end;
 
 function SetupSharedMemory(const ShmTarget: string): POMMSharedMemory;
 var
+  {$IFDEF UNIX}
   fd: cint;
-  pShm: POMMSharedMemory;
   isRegularFile: Boolean;
+  {$ENDIF}
+  pShm: POMMSharedMemory;
 begin
   Result := nil;
+  {$IFDEF UNIX}
   // POSIX shm names start with a single slash and contain no other slashes (e.g. /omm_shm)
   isRegularFile := (Pos('/', Copy(ShmTarget, 2, Length(ShmTarget))) > 0) or
                    ((Length(ShmTarget) > 0) and (ShmTarget[1] <> '/'));
@@ -156,6 +171,10 @@ begin
   begin
     pShm := CreateSharedMemory(ShmTarget);
   end;
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  pShm := CreateSharedMemory(ShmTarget);
+  {$ENDIF}
 
   if (pShm = nil) or (pShm = POMMSharedMemory(Pointer(-1))) then
     Exit(nil);
@@ -164,7 +183,7 @@ begin
   pShm^.Magic := OMM_SHM_MAGIC;
   pShm^.Version := OMM_SHM_VERSION;
   pShm^.SpectrumBands := OMM_SPECTRUM_BANDS;
-  pShm^.DaemonPID := fpGetPID;
+  pShm^.DaemonPID := FpGetpid;
   pShm^.Volume := 1.0;
 
   Result := pShm;
@@ -404,7 +423,7 @@ begin
         pShm^.PluginRssBytes := Watchdog.RssBytes;
         SeqLockWriteEnd(pShm^.SeqLock);
       end;
-      malloc_trim(0);
+      omm_malloc_trim;
       InitPacket(resp, OP_RESP_OK, Req.SeqID, OMM_OK);
       SendPacket(ClientFD, resp);
     end;
@@ -420,7 +439,7 @@ begin
         pShm^.PluginRssBytes := 0;
         SeqLockWriteEnd(pShm^.SeqLock);
       end;
-      malloc_trim(0);
+      omm_malloc_trim;
       InitPacket(resp, OP_RESP_OK, Req.SeqID, OMM_OK);
       SendPacket(ClientFD, resp);
     end;
@@ -484,23 +503,30 @@ var
   Router: TOmmRouter;
   serverFD: cint;
   pollCount: cint;
-  pollFds: array[0..MAX_CLIENTS] of TPollFD;
+  pollFds: array[0..MAX_CLIENTS] of {$IFDEF UNIX}TPollFD{$ELSE}pollfd{$ENDIF};
   clientCount: Integer;
   k: Integer;
   newClient: cint;
   reqPkt: TOMMPacket;
   lastSec, nowSec, startTimeSec: UInt32;
+  {$IFDEF UNIX}
   sigAct: SigactionRec;
+  {$ENDIF}
 
 begin
   ParseCommandLine;
 
   // Set up signal handling
+  {$IFDEF UNIX}
   FillChar(sigAct, SizeOf(sigAct), 0);
   sigAct.sa_handler := SigactionHandler(@SigHandler);
   fpSigaction(SIGINT, @sigAct, nil);
   fpSigaction(SIGTERM, @sigAct, nil);
   fpSignal(SIGPIPE, SignalHandler(SIG_IGN)); // Ignore SIGPIPE
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  SetConsoleCtrlHandler(@WinCtrlHandler, True);
+  {$ENDIF}
 
   // 0. Ensure any previous daemon instance bound to this socket/SHM is cleanly terminated
   EnsureSingleDaemonInstance(GSocketPath, GShmPath);

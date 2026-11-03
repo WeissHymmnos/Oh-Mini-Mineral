@@ -14,6 +14,11 @@ const
 type
   TURIScheme = (usUnsupported, usLocalFile, usMineralStream);
 
+  TLyricEntry = record
+    TimestampMs: UInt32;
+    Text: string;
+  end;
+
   TOmmRouter = class
   private
     FWatchdog: TOmmWatchdog;
@@ -25,7 +30,14 @@ type
     FPrefetchURI: string;
     FPrefetchActive: Boolean;
     FActiveStreamHandle: TOmmStreamHandle;
+    FLyrics: array of TLyricEntry;
+    FLyricCount: Integer;
+    FLastLyricIdx: Integer;
     procedure CancelPrefetch;
+    procedure ClearLyrics;
+    procedure ParseLrcContent(const RawLrc: string);
+    procedure LoadLyricsForTrack(Scheme: TURIScheme; const CleanTarget: string);
+    procedure SyncLyricsToSHM(PosMs: UInt32; ForceUpdate: Boolean = False);
   public
     constructor Create(AWatchdog: TOmmWatchdog; ALibrary: TOMMLibraryEngine; APShm: POMMSharedMemory);
     destructor Destroy; override;
@@ -97,6 +109,9 @@ begin
   FPrefetchURI := '';
   FPrefetchActive := False;
   FActiveStreamHandle := nil;
+  FLyricCount := 0;
+  FLastLyricIdx := -1;
+  SetLength(FLyrics, 0);
   GRouterWatchdog := AWatchdog;
 end;
 
@@ -104,6 +119,242 @@ destructor TOmmRouter.Destroy;
 begin
   Stop;
   inherited Destroy;
+end;
+
+procedure TOmmRouter.ClearLyrics;
+begin
+  FLyricCount := 0;
+  FLastLyricIdx := -1;
+  SetLength(FLyrics, 0);
+  if FPShm <> nil then
+  begin
+    SeqLockWriteBegin(FPShm^.SeqLock);
+    FillChar(FPShm^.LyricCurrent[0], SizeOf(FPShm^.LyricCurrent), 0);
+    FillChar(FPShm^.LyricNext[0], SizeOf(FPShm^.LyricNext), 0);
+    SeqLockWriteEnd(FPShm^.SeqLock);
+  end;
+end;
+
+procedure TOmmRouter.ParseLrcContent(const RawLrc: string);
+var
+  lineStart, lineEnd, i, n, p, closePos, colonPos, dotPos: Integer;
+  lineStr, tagStr, minStr, secStr, fracStr, textPart: string;
+  mins, secs, frac, code: Integer;
+  tsMs: UInt32;
+  lineTimestamps: array[0..15] of UInt32;
+  tsCount, j, k: Integer;
+  tmpEntry: TLyricEntry;
+begin
+  FLyricCount := 0;
+  FLastLyricIdx := -1;
+  SetLength(FLyrics, 0);
+
+  n := Length(RawLrc);
+  lineStart := 1;
+  while lineStart <= n do
+  begin
+    lineEnd := lineStart;
+    while (lineEnd <= n) and not (RawLrc[lineEnd] in [#10, #13]) do
+      Inc(lineEnd);
+
+    lineStr := Trim(Copy(RawLrc, lineStart, lineEnd - lineStart));
+    lineStart := lineEnd + 1;
+    if (lineStart <= n) and (RawLrc[lineEnd] = #13) and (RawLrc[lineStart] = #10) then
+      Inc(lineStart);
+
+    if lineStr = '' then
+      Continue;
+
+    tsCount := 0;
+    p := 1;
+    while (p <= Length(lineStr)) and (lineStr[p] = '[') do
+    begin
+      closePos := Pos(']', Copy(lineStr, p, Length(lineStr) - p + 1));
+      if closePos <= 1 then
+        Break;
+      tagStr := Copy(lineStr, p + 1, closePos - 2);
+      colonPos := Pos(':', tagStr);
+      if colonPos > 1 then
+      begin
+        minStr := Copy(tagStr, 1, colonPos - 1);
+        Val(minStr, mins, code);
+        if code = 0 then
+        begin
+          dotPos := Pos('.', tagStr);
+          if dotPos = 0 then
+            dotPos := Pos(':', Copy(tagStr, colonPos + 1, Length(tagStr)));
+          if dotPos > colonPos then
+          begin
+            secStr := Copy(tagStr, colonPos + 1, dotPos - colonPos - 1);
+            fracStr := Copy(tagStr, dotPos + 1, Length(tagStr) - dotPos);
+          end
+          else
+          begin
+            secStr := Copy(tagStr, colonPos + 1, Length(tagStr) - colonPos);
+            fracStr := '0';
+          end;
+          Val(secStr, secs, code);
+          if code = 0 then
+          begin
+            Val(fracStr, frac, code);
+            if code <> 0 then frac := 0;
+            if Length(fracStr) = 1 then
+              frac := frac * 100
+            else if Length(fracStr) = 2 then
+              frac := frac * 10
+            else if Length(fracStr) > 3 then
+              while frac >= 1000 do frac := frac div 10;
+
+            tsMs := UInt32(Max(0, mins)) * 60000 + UInt32(Max(0, secs)) * 1000 + UInt32(Max(0, frac));
+            if tsCount < Length(lineTimestamps) then
+            begin
+              lineTimestamps[tsCount] := tsMs;
+              Inc(tsCount);
+            end;
+            p := p + closePos;
+            Continue;
+          end;
+        end;
+      end;
+      // Non-timestamp metadata tag like [ar:...], [ti:...]
+      p := p + closePos;
+    end;
+
+    if tsCount > 0 then
+    begin
+      textPart := Trim(Copy(lineStr, p, Length(lineStr) - p + 1));
+      if textPart <> '' then
+      begin
+        for i := 0 to tsCount - 1 do
+        begin
+          if FLyricCount >= Length(FLyrics) then
+            SetLength(FLyrics, Max(32, Length(FLyrics) * 2));
+          FLyrics[FLyricCount].TimestampMs := lineTimestamps[i];
+          FLyrics[FLyricCount].Text := textPart;
+          Inc(FLyricCount);
+        end;
+      end;
+    end;
+  end;
+
+  // Insertion sort by TimestampMs
+  for j := 1 to FLyricCount - 1 do
+  begin
+    tmpEntry := FLyrics[j];
+    k := j - 1;
+    while (k >= 0) and (FLyrics[k].TimestampMs > tmpEntry.TimestampMs) do
+    begin
+      FLyrics[k + 1] := FLyrics[k];
+      Dec(k);
+    end;
+    FLyrics[k + 1] := tmpEntry;
+  end;
+end;
+
+procedure TOmmRouter.LoadLyricsForTrack(Scheme: TURIScheme; const CleanTarget: string);
+var
+  lrcPath, rawLrc: string;
+  f: File;
+  fileSz: Int64;
+  bytesRead: SizeInt;
+  lrcBuf: array[0..32767] of Byte;
+  outLen: SizeUInt;
+begin
+  ClearLyrics;
+  rawLrc := '';
+
+  if Scheme = usLocalFile then
+  begin
+    lrcPath := ChangeFileExt(CleanTarget, '.lrc');
+    if not FileExists(lrcPath) then
+      lrcPath := ChangeFileExt(CleanTarget, '.LRC');
+    if FileExists(lrcPath) then
+    begin
+      AssignFile(f, lrcPath);
+      {$I-}
+      FileMode := fmOpenRead;
+      Reset(f, 1);
+      {$I+}
+      if IOResult = 0 then
+      begin
+        fileSz := FileSize(f);
+        if (fileSz > 0) and (fileSz <= 65536) then
+        begin
+          SetLength(rawLrc, fileSz);
+          BlockRead(f, rawLrc[1], fileSz, bytesRead);
+          if bytesRead < fileSz then
+            SetLength(rawLrc, bytesRead);
+        end;
+        CloseFile(f);
+      end;
+    end;
+  end
+  else if (Scheme = usMineralStream) and (FWatchdog <> nil) then
+  begin
+    outLen := 0;
+    FillChar(lrcBuf[0], SizeOf(lrcBuf), 0);
+    if (FWatchdog.FetchLyrics(CleanTarget, @lrcBuf[0], SizeOf(lrcBuf) - 1, outLen) = OMM_OK) and
+       (outLen > 0) then
+    begin
+      if outLen >= SizeOf(lrcBuf) then
+        outLen := SizeOf(lrcBuf) - 1;
+      SetLength(rawLrc, outLen);
+      Move(lrcBuf[0], rawLrc[1], outLen);
+    end;
+  end;
+
+  if rawLrc <> '' then
+    ParseLrcContent(rawLrc);
+
+  SyncLyricsToSHM(0, True);
+end;
+
+procedure TOmmRouter.SyncLyricsToSHM(PosMs: UInt32; ForceUpdate: Boolean);
+var
+  idx, i: Integer;
+  curStr, nextStr: string;
+begin
+  if FPShm = nil then Exit;
+
+  if FLyricCount <= 0 then
+  begin
+    if ForceUpdate then
+    begin
+      SeqLockWriteBegin(FPShm^.SeqLock);
+      FillChar(FPShm^.LyricCurrent[0], SizeOf(FPShm^.LyricCurrent), 0);
+      FillChar(FPShm^.LyricNext[0], SizeOf(FPShm^.LyricNext), 0);
+      SeqLockWriteEnd(FPShm^.SeqLock);
+    end;
+    Exit;
+  end;
+
+  idx := 0;
+  for i := 0 to FLyricCount - 1 do
+  begin
+    if FLyrics[i].TimestampMs <= PosMs then
+      idx := i
+    else
+      Break;
+  end;
+
+  if (not ForceUpdate) and (idx = FLastLyricIdx) then
+    Exit;
+
+  FLastLyricIdx := idx;
+  curStr := FLyrics[idx].Text;
+  if idx + 1 < FLyricCount then
+    nextStr := FLyrics[idx + 1].Text
+  else
+    nextStr := '';
+
+  SeqLockWriteBegin(FPShm^.SeqLock);
+  FillChar(FPShm^.LyricCurrent[0], SizeOf(FPShm^.LyricCurrent), 0);
+  if curStr <> '' then
+    Move(curStr[1], FPShm^.LyricCurrent[0], Min(Length(curStr), SizeOf(FPShm^.LyricCurrent) - 1));
+  FillChar(FPShm^.LyricNext[0], SizeOf(FPShm^.LyricNext), 0);
+  if nextStr <> '' then
+    Move(nextStr[1], FPShm^.LyricNext[0], Min(Length(nextStr), SizeOf(FPShm^.LyricNext) - 1));
+  SeqLockWriteEnd(FPShm^.SeqLock);
 end;
 
 procedure TOmmRouter.CancelPrefetch;
@@ -214,6 +465,7 @@ begin
       SeqLockWriteEnd(FPShm^.SeqLock);
     end;
 
+    LoadLyricsForTrack(scheme, cleanTarget);
     Result := OMM_OK;
   end
   else
@@ -264,6 +516,7 @@ begin
       SeqLockWriteEnd(FPShm^.SeqLock);
     end;
 
+    LoadLyricsForTrack(scheme, cleanTarget);
     Result := OMM_OK;
   end;
 end;
@@ -324,6 +577,7 @@ begin
   end;
   FCurrentTrackID := 0;
   FCurrentURI := '';
+  ClearLyrics;
 
   if FPShm <> nil then
   begin
@@ -363,6 +617,7 @@ begin
     FPShm^.PositionMs := TargetMs;
     SeqLockWriteEnd(FPShm^.SeqLock);
   end;
+  SyncLyricsToSHM(TargetMs, True);
 end;
 
 function TOmmRouter.SetVolume(Vol: Single): Int32;
@@ -433,6 +688,10 @@ begin
         end;
       end;
       SeqLockWriteEnd(FPShm^.SeqLock);
+
+      scheme := ParseScheme(FCurrentURI, cleanTarget);
+      if scheme <> usUnsupported then
+        LoadLyricsForTrack(scheme, cleanTarget);
     end
     else
     begin
@@ -441,6 +700,13 @@ begin
       FPrefetchTrackID := 0;
       FPrefetchURI := '';
     end;
+  end;
+
+  // Synchronize LRC lyrics with current playback timestamp
+  if omm_audio_get_state() = OMM_STATE_PLAYING then
+  begin
+    posMs := omm_audio_get_position_ms();
+    SyncLyricsToSHM(posMs, False);
   end;
 
   // 2. If prefetch is already armed, wait for transition

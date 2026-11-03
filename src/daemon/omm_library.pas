@@ -1,14 +1,14 @@
 unit omm_library;
 
 {$mode objfpc}{$H+}
-{$asmmode intel}
+{$IFDEF CPUX86_64}{$asmmode intel}{$ENDIF}
 {$PACKRECORDS C}
 {$pointermath on}
 
 interface
 
 uses
-  BaseUnix, Unix, SysUtils, Classes, Math, omm_shm, omm_ipc;
+  {$IFDEF UNIX}BaseUnix, Unix,{$ENDIF} ctypes, SysUtils, Classes, Math, omm_os, omm_shm, omm_ipc;
 
 const
   OMM_LIBRARY_MAGIC   = $4F4D4D4C; // 'OMML'
@@ -102,6 +102,22 @@ begin
   Result := Sqrt(sumSq);
 end;
 
+function DotProductInt8Scalar(pA, pB: Pointer): LongInt;
+var
+  A: PShortInt;
+  B: PShortInt;
+  i: Integer;
+  sum: LongInt;
+begin
+  A := PShortInt(pA);
+  B := PShortInt(pB);
+  sum := 0;
+  for i := 0 to 31 do
+    Inc(sum, LongInt(A[i]) * B[i]);
+  Result := sum;
+end;
+
+{$IF defined(CPUX86_64) and defined(UNIX)}
 function DotProductInt8SSE(pA, pB: Pointer): LongInt;
 assembler; nostackframe;
 asm
@@ -141,21 +157,12 @@ asm
   paddd xmm4, xmm0
   movd eax, xmm4
 end;
-
-function DotProductInt8Scalar(pA, pB: Pointer): LongInt;
-var
-  A: PShortInt;
-  B: PShortInt;
-  i: Integer;
-  sum: LongInt;
+{$ELSE}
+function DotProductInt8SSE(pA, pB: Pointer): LongInt;
 begin
-  A := PShortInt(pA);
-  B := PShortInt(pB);
-  sum := 0;
-  for i := 0 to 31 do
-    Inc(sum, LongInt(A[i]) * B[i]);
-  Result := sum;
+  Result := DotProductInt8Scalar(pA, pB);
 end;
+{$ENDIF}
 
 function CalculateCosineSimilarity(constref Q, C: TOMMTrackRecord): Single;
 var
@@ -303,9 +310,9 @@ begin
   FIsOpen := False;
   FMusicDir := AMusicDir;
   if ALibraryFile <> '' then
-    FLibraryFile := ALibraryFile
+    FLibraryFile := NormalizeOmmPath(ALibraryFile)
   else
-    FLibraryFile := OMM_DEFAULT_LIBRARY_PATH;
+    FLibraryFile := NormalizeOmmPath(OMM_DEFAULT_LIBRARY_PATH);
 end;
 
 destructor TOMMLibraryEngine.Destroy;
@@ -1233,7 +1240,7 @@ var
             if Length(storePath) > 127 then
             begin
               fpMkDir('/tmp/omm_links', &755);
-              storePath := '/tmp/omm_links/trk_' + IntToStr(trackIdCounter) + ext;
+              storePath := NormalizeOmmPath('/tmp/omm_links/trk_' + IntToStr(trackIdCounter) + ext);
               fpUnlink(PChar(storePath));
               fpSymlink(PChar(fullPath), PChar(storePath));
             end;

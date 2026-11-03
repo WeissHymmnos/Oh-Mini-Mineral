@@ -4,7 +4,7 @@ library libcodec_mp3;
 {$PACKRECORDS C}
 
 uses
-  dynlibs, ctypes, omm_codec_abi;
+  dynlibs, ctypes, omm_codec_abi, omm_os;
 
 const
   SFM_READ = $10;
@@ -309,7 +309,7 @@ begin
   ParseMpegHeader(h);
 
   // 1. Primary MP3 decoder: libmpg123.so.0 (supports all MPEG-1/2/2.5 Layer I/II/III streams)
-  h^.MpgLib := LoadLibrary('libmpg123.so.0');
+  h^.MpgLib := LoadMpg123Library;
   if h^.MpgLib <> NilHandle then
   begin
     Pointer(h^.fnMpgInit)          := GetProcedureAddress(h^.MpgLib, 'mpg123_init');
@@ -366,7 +366,7 @@ begin
   // 2. Fallback: libsndfile.so.1 (if libmpg123 wasn't opened)
   if h^.MpgHandle = nil then
   begin
-    h^.SndLib := LoadLibrary('libsndfile.so.1');
+    h^.SndLib := LoadSndFileLibrary;
     if h^.SndLib <> NilHandle then
     begin
       Pointer(h^.fnOpenVirtual) := GetProcedureAddress(h^.SndLib, 'sf_open_virtual');

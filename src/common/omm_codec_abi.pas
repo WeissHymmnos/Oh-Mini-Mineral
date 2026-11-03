@@ -25,6 +25,16 @@ const
   OMM_SEEK_CUR = 1;
   OMM_SEEK_END = 2;
 
+  {$IFDEF LINUX}
+  CODEC_EXT = '.so';
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  CODEC_EXT = '.dylib';
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  CODEC_EXT = '.dll';
+  {$ENDIF}
+
 type
   // Underlying byte-stream callbacks (compatible with file:// and mineral:// ring buffers)
   TCodecReadCallback = function(StreamCtx: Pointer; Buffer: PByte; Count: SizeUInt; OutRead: PSizeUInt): Int32; cdecl;
@@ -85,38 +95,38 @@ const
     // Level 1: Mainstream Pure Pascal Plugins
     (CodecID: cidFlac; Tier: ctMainstreamPure; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('f'), Ord('L'), Ord('a'), Ord('C'), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_flac.so'; FormatName: 'FLAC'),
+     PluginPath: 'bin/codecs/libcodec_flac' + CODEC_EXT; FormatName: 'FLAC'),
     (CodecID: cidMp3; Tier: ctMainstreamPure; MagicOffset: 0; MagicLen: 3;
      MagicBytes: (Ord('I'), Ord('D'), Ord('3'), 0, 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_mp3.so'; FormatName: 'MP3'),
+     PluginPath: 'bin/codecs/libcodec_mp3' + CODEC_EXT; FormatName: 'MP3'),
     (CodecID: cidOgg; Tier: ctMainstreamPure; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('O'), Ord('g'), Ord('g'), Ord('S'), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_ogg.so'; FormatName: 'OGG/Opus'),
+     PluginPath: 'bin/codecs/libcodec_ogg' + CODEC_EXT; FormatName: 'OGG/Opus'),
 
     // Level 2: Audiophile Lossless & Retro Tracker Plugins
     (CodecID: cidApe; Tier: ctAudiophileRetro; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('M'), Ord('A'), Ord('C'), Ord(' '), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_ape.so'; FormatName: 'APE'),
+     PluginPath: 'bin/codecs/libcodec_ape' + CODEC_EXT; FormatName: 'APE'),
     (CodecID: cidWavPack; Tier: ctAudiophileRetro; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('w'), Ord('v'), Ord('p'), Ord('k'), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_wv.so'; FormatName: 'WavPack'),
+     PluginPath: 'bin/codecs/libcodec_wv' + CODEC_EXT; FormatName: 'WavPack'),
     (CodecID: cidDsd; Tier: ctAudiophileRetro; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('D'), Ord('S'), Ord('D'), Ord(' '), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_dsd.so'; FormatName: 'DSD/DSF'),
+     PluginPath: 'bin/codecs/libcodec_dsd' + CODEC_EXT; FormatName: 'DSD/DSF'),
     (CodecID: cidDsd; Tier: ctAudiophileRetro; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('F'), Ord('R'), Ord('M'), Ord('8'), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_dsd.so'; FormatName: 'DSD/DFF'),
+     PluginPath: 'bin/codecs/libcodec_dsd' + CODEC_EXT; FormatName: 'DSD/DFF'),
     (CodecID: cidTracker; Tier: ctAudiophileRetro; MagicOffset: 0; MagicLen: 4;
      MagicBytes: (Ord('I'), Ord('M'), Ord('P'), Ord('M'), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_tracker.so'; FormatName: 'Tracker'),
+     PluginPath: 'bin/codecs/libcodec_tracker' + CODEC_EXT; FormatName: 'Tracker'),
     (CodecID: cidTracker; Tier: ctAudiophileRetro; MagicOffset: 0; MagicLen: 8;
      MagicBytes: (Ord('E'), Ord('x'), Ord('t'), Ord('e'), Ord('n'), Ord('d'), Ord('e'), Ord('d'));
-     PluginPath: 'bin/codecs/libcodec_tracker.so'; FormatName: 'XM/MOD'),
+     PluginPath: 'bin/codecs/libcodec_tracker' + CODEC_EXT; FormatName: 'XM/MOD'),
 
     // Level 3: System Ecosystem Bridge (M4A / ALAC / AAC / WMA / AMR)
     (CodecID: cidSysBridge; Tier: ctSystemBridge; MagicOffset: 4; MagicLen: 4;
      MagicBytes: (Ord('f'), Ord('t'), Ord('y'), Ord('p'), 0, 0, 0, 0);
-     PluginPath: 'bin/codecs/libcodec_sysbridge.so'; FormatName: 'M4A/ALAC/AAC')
+     PluginPath: 'bin/codecs/libcodec_sysbridge' + CODEC_EXT; FormatName: 'M4A/ALAC/AAC')
   );
 
 function SniffMagic16(Header16: PByte; out OutPluginPath: PAnsiChar): TCodecID;
@@ -127,14 +137,14 @@ implementation
 function GetCodecPluginPath(CodecID: TCodecID): PAnsiChar;
 begin
   case CodecID of
-    cidFlac:      Result := 'bin/codecs/libcodec_flac.so';
-    cidMp3:       Result := 'bin/codecs/libcodec_mp3.so';
-    cidOgg:       Result := 'bin/codecs/libcodec_ogg.so';
-    cidApe:       Result := 'bin/codecs/libcodec_ape.so';
-    cidWavPack:   Result := 'bin/codecs/libcodec_wv.so';
-    cidDsd:       Result := 'bin/codecs/libcodec_dsd.so';
-    cidTracker:   Result := 'bin/codecs/libcodec_tracker.so';
-    cidSysBridge: Result := 'bin/codecs/libcodec_sysbridge.so';
+    cidFlac:      Result := 'bin/codecs/libcodec_flac' + CODEC_EXT;
+    cidMp3:       Result := 'bin/codecs/libcodec_mp3' + CODEC_EXT;
+    cidOgg:       Result := 'bin/codecs/libcodec_ogg' + CODEC_EXT;
+    cidApe:       Result := 'bin/codecs/libcodec_ape' + CODEC_EXT;
+    cidWavPack:   Result := 'bin/codecs/libcodec_wv' + CODEC_EXT;
+    cidDsd:       Result := 'bin/codecs/libcodec_dsd' + CODEC_EXT;
+    cidTracker:   Result := 'bin/codecs/libcodec_tracker' + CODEC_EXT;
+    cidSysBridge: Result := 'bin/codecs/libcodec_sysbridge' + CODEC_EXT;
     else          Result := '';
   end;
 end;
@@ -191,12 +201,12 @@ begin
     if (Header16[1] and $06) = 0 then
     begin
       // Layer 00 in MPEG header => ADTS AAC
-      OutPluginPath := 'bin/codecs/libcodec_sysbridge.so';
+      OutPluginPath := 'bin/codecs/libcodec_sysbridge' + CODEC_EXT;
       Exit(cidSysBridge);
     end
     else
     begin
-      OutPluginPath := 'bin/codecs/libcodec_mp3.so';
+      OutPluginPath := 'bin/codecs/libcodec_mp3' + CODEC_EXT;
       Exit(cidMp3);
     end;
   end;

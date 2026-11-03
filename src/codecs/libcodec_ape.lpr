@@ -4,9 +4,7 @@ library libcodec_ape;
 {$PACKRECORDS C}
 
 uses
-  BaseUnix, ctypes, omm_codec_abi;
-
-function c_system(cmd: PAnsiChar): cint; cdecl; external 'c' name 'system';
+  {$IFDEF UNIX}BaseUnix,{$ENDIF} ctypes, omm_codec_abi, omm_os;
 
 type
   // Per-handle isolated Monkey's Audio (APE) decoder context

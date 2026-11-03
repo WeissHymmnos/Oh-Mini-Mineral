@@ -4,13 +4,17 @@ program omm_tui;
 {$PACKRECORDS C}
 
 uses
-  BaseUnix, Termio, SysUtils, Math,
-  omm_ipc, omm_shm, omm_library;
+  {$IFDEF UNIX}BaseUnix, Unix, Termio,{$ENDIF}
+  {$IFDEF WINDOWS}Windows,{$ENDIF}
+  ctypes, SysUtils, Math,
+  omm_os, omm_ipc, omm_shm, omm_library;
 
 const
+  {$IFDEF UNIX}
   STDIN_FILENO  = 0;
   STDOUT_FILENO = 1;
   STDERR_FILENO = 2;
+  {$ENDIF}
 
   APP_VERSION = '1.0.0';
   FRAME_INTERVAL_MS = 16; // ~60 FPS
@@ -19,6 +23,8 @@ const
   // ANSI Escape Sequences
   CSI_ALT_SCREEN_ON  = #27'[?1049h';
   CSI_ALT_SCREEN_OFF = #27'[?1049l';
+  CSI_AUTOWRAP_OFF   = #27'[?7l';
+  CSI_AUTOWRAP_ON    = #27'[?7h';
   CSI_CURSOR_HIDE    = #27'[?25l';
   CSI_CURSOR_SHOW    = #27'[?25h';
   CSI_HOME           = #27'[H';
@@ -56,8 +62,14 @@ type
   end;
 
   TTerminalState = record
+    {$IFDEF UNIX}
     OrigTermios: TermIOS;
     RawTermios: TermIOS;
+    {$ENDIF}
+    {$IFDEF WINDOWS}
+    OrigInMode: DWORD;
+    OrigOutMode: DWORD;
+    {$ENDIF}
     IsTTY: Boolean;
     Rows: Word;
     Cols: Word;
@@ -83,6 +95,13 @@ type
     QuantizedPeaks: array[0..63] of UInt8;
   end;
 
+  TInputMode = (imNone, imLocalFilter, imOnlineSearch);
+  TVirtualKey = (vkNone, vkUp, vkDown, vkLeft, vkRight, vkPgUp, vkPgDn, vkHome, vkEnd, vkDelete);
+
+const
+  MAX_ONLINE_TRACKS = 256;
+  MAX_FILTERED_TRACKS = 65536;
+
 var
   GTerm: TTerminalState;
   GFrameBuf: TFrameBuffer;
@@ -94,11 +113,23 @@ var
   GOnceOnly: Boolean = False;
   GTestTimeoutSec: Integer = 0;
   GTerminated: Boolean = False;
-  GFilterActive: Boolean = False;
+  GInputMode: TInputMode = imNone;
   GFilterBuf: array[0..127] of AnsiChar;
   GFilterLen: Integer = 0;
+  GSearchBuf: array[0..127] of AnsiChar;
+  GSearchLen: Integer = 0;
+  GSourceIdx: Integer = 0; // 0=Local, 1=NetEase, 2=Bilibili, 3=AppleMusic, 4=QQMusic
+  GIsOnlineMode: Boolean = False;
+  GOnlineSearching: Boolean = False;
+  GOnlineTracks: array[0..MAX_ONLINE_TRACKS - 1] of TOMMCondensedTrack;
+  GOnlineTrackCount: Cardinal = 0;
+  GFilteredIndices: array of Cardinal;
+  GFilteredCount: Cardinal = 0;
   GSelectedTrackIdx: Cardinal = 0;
   GViewportTopIdx: Cardinal = 0;
+  GLastPlayedOnlineIdx: Integer = -1;
+  GStatusMsg: string = '';
+  GStatusExpireTick: Int64 = 0;
   GSeqCounter: UInt32 = 100;
   FSocketFD: cint = -1;
   FPShm: POMMSharedMemory = nil;
@@ -106,29 +137,12 @@ var
   GStartTick: Int64 = 0;
 
 // =============================================================================
-// Frame Buffer Zero-Heap Routines
+// Frame Buffer & UTF-8 Display Column Routines (Zero-Truncation, Zero-Heap)
 // =============================================================================
 
 procedure BufClear(var Buf: TFrameBuffer); inline;
 begin
   Buf.Len := 0;
-end;
-
-procedure BufAppendPChar(var Buf: TFrameBuffer; P: PAnsiChar; MaxLen: Integer);
-var
-  len: Integer;
-begin
-  if (P = nil) or (MaxLen <= 0) then Exit;
-  len := 0;
-  while (len < MaxLen) and (P[len] <> #0) do
-    Inc(len);
-  if Buf.Len + len > MAX_FRAME_BUF then
-    len := MAX_FRAME_BUF - Buf.Len;
-  if len > 0 then
-  begin
-    Move(P[0], Buf.Data[Buf.Len], len);
-    Inc(Buf.Len, len);
-  end;
 end;
 
 procedure BufAppendStr(var Buf: TFrameBuffer; const S: string);
@@ -166,6 +180,136 @@ begin
   for i := 0 to n - 1 do
     Buf.Data[Buf.Len + i] := ' ';
   Inc(Buf.Len, n);
+end;
+
+function IsWideCodePoint(cp: Cardinal): Boolean; inline;
+begin
+  Result := (cp >= $1100) and (
+    (cp <= $115F) or
+    (cp = $2329) or (cp = $232A) or
+    ((cp >= $2E80) and (cp <= $A4CF) and (cp <> $303F)) or
+    ((cp >= $AC00) and (cp <= $D7A3)) or
+    ((cp >= $F900) and (cp <= $FAFF)) or
+    ((cp >= $FE10) and (cp <= $FE6F)) or
+    ((cp >= $FF00) and (cp <= $FF60)) or
+    ((cp >= $FFE0) and (cp <= $FFE6)) or
+    (cp >= $1F000)
+  );
+end;
+
+function DecodeUtf8At(P: PAnsiChar; Idx, MaxBytes: Integer; out SeqLen, ColWidth: Integer): Boolean;
+var
+  b0, b1, b2, b3, cp: Cardinal;
+begin
+  Result := False;
+  SeqLen := 1;
+  ColWidth := 0;
+  if (P = nil) or (Idx >= MaxBytes) or (P[Idx] = #0) then Exit;
+
+  b0 := Ord(P[Idx]);
+  if b0 < $80 then
+  begin
+    SeqLen := 1;
+    ColWidth := 1;
+    Result := True;
+  end
+  else if (b0 and $E0) = $C0 then
+  begin
+    if (Idx + 2 <= MaxBytes) and (P[Idx + 1] <> #0) and ((Ord(P[Idx + 1]) and $C0) = $80) then
+    begin
+      SeqLen := 2;
+      ColWidth := 1;
+      Result := True;
+    end;
+  end
+  else if (b0 and $F0) = $E0 then
+  begin
+    if (Idx + 3 <= MaxBytes) and
+       (P[Idx + 1] <> #0) and ((Ord(P[Idx + 1]) and $C0) = $80) and
+       (P[Idx + 2] <> #0) and ((Ord(P[Idx + 2]) and $C0) = $80) then
+    begin
+      b1 := Ord(P[Idx + 1]) and $3F;
+      b2 := Ord(P[Idx + 2]) and $3F;
+      cp := ((b0 and $0F) shl 12) or (b1 shl 6) or b2;
+      SeqLen := 3;
+      if IsWideCodePoint(cp) then ColWidth := 2 else ColWidth := 1;
+      Result := True;
+    end;
+  end
+  else if (b0 and $F8) = $F0 then
+  begin
+    if (Idx + 4 <= MaxBytes) and
+       (P[Idx + 1] <> #0) and ((Ord(P[Idx + 1]) and $C0) = $80) and
+       (P[Idx + 2] <> #0) and ((Ord(P[Idx + 2]) and $C0) = $80) and
+       (P[Idx + 3] <> #0) and ((Ord(P[Idx + 3]) and $C0) = $80) then
+    begin
+      b1 := Ord(P[Idx + 1]) and $3F;
+      b2 := Ord(P[Idx + 2]) and $3F;
+      b3 := Ord(P[Idx + 3]) and $3F;
+      cp := ((b0 and $07) shl 18) or (b1 shl 12) or (b2 shl 6) or b3;
+      SeqLen := 4;
+      if IsWideCodePoint(cp) then ColWidth := 2 else ColWidth := 1;
+      Result := True;
+    end;
+  end;
+end;
+
+function Utf8DisplayCols(const S: string): Integer;
+var
+  idx, maxB, seqLen, colW: Integer;
+begin
+  Result := 0;
+  maxB := Length(S);
+  if maxB = 0 then Exit;
+  idx := 0;
+  while idx < maxB do
+  begin
+    if DecodeUtf8At(PAnsiChar(S), idx, maxB, seqLen, colW) then
+    begin
+      Inc(Result, colW);
+      Inc(idx, seqLen);
+    end
+    else
+      Inc(idx);
+  end;
+end;
+
+procedure BufAppendUtf8Cols(var Buf: TFrameBuffer; P: PAnsiChar; MaxBytes, MaxCols: Integer);
+var
+  idx, usedCols, seqLen, colW: Integer;
+begin
+  if (P = nil) or (MaxBytes <= 0) or (MaxCols <= 0) then Exit;
+  idx := 0;
+  usedCols := 0;
+  while (idx < MaxBytes) and (P[idx] <> #0) do
+  begin
+    if DecodeUtf8At(P, idx, MaxBytes, seqLen, colW) then
+    begin
+      if usedCols + colW > MaxCols then
+        Break;
+      if Buf.Len + seqLen > MAX_FRAME_BUF then
+        Break;
+      if (seqLen = 1) and (Ord(P[idx]) < 32) then
+        BufAppendChar(Buf, ' ')
+      else
+      begin
+        Move(P[idx], Buf.Data[Buf.Len], seqLen);
+        Inc(Buf.Len, seqLen);
+      end;
+      Inc(usedCols, colW);
+      Inc(idx, seqLen);
+    end
+    else
+    begin
+      // Skip invalid or truncated trailing UTF-8 byte without emitting broken sequence
+      Inc(idx);
+    end;
+  end;
+end;
+
+procedure BufAppendPChar(var Buf: TFrameBuffer; P: PAnsiChar; MaxCols: Integer);
+begin
+  BufAppendUtf8Cols(Buf, P, 256, MaxCols);
 end;
 
 procedure BufAppendInt(var Buf: TFrameBuffer; Val: Int64; MinDigits: Integer = 1);
@@ -234,9 +378,16 @@ end;
 // =============================================================================
 
 procedure TermUpdateSize(var Term: TTerminalState);
+{$IFDEF UNIX}
 var
   ws: TWinSize;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  csbi: CONSOLE_SCREEN_BUFFER_INFO;
+{$ENDIF}
 begin
+  {$IFDEF UNIX}
   if Term.IsTTY and (FpIOCtl(STDOUT_FILENO, TIOCGWINSZ, @ws) = 0) and
      (ws.ws_row > 0) and (ws.ws_col > 0) then
   begin
@@ -248,25 +399,67 @@ begin
     Term.Rows := 24;
     Term.Cols := 80;
   end;
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  if Term.IsTTY and GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), csbi) and
+     (csbi.srWindow.Right >= csbi.srWindow.Left) and (csbi.srWindow.Bottom >= csbi.srWindow.Top) then
+  begin
+    Term.Cols := Word(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+    Term.Rows := Word(csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+  end
+  else
+  begin
+    Term.Rows := 24;
+    Term.Cols := 80;
+  end;
+  {$ENDIF}
 end;
 
 procedure TermInit(var Term: TTerminalState);
+{$IFDEF WINDOWS}
+const
+  ENABLE_VIRTUAL_TERMINAL_PROCESSING = $0004;
+  ENABLE_VIRTUAL_TERMINAL_INPUT      = $0200;
+var
+  hIn, hOut: THandle;
+{$ENDIF}
 begin
+  {$IFDEF UNIX}
   Term.IsTTY := (TCGetAttr(STDIN_FILENO, Term.OrigTermios) = 0);
   if Term.IsTTY then
   begin
     Term.RawTermios := Term.OrigTermios;
     CFMakeRaw(Term.RawTermios);
+    // Keep output post-processing (ONLCR) enabled so LF never staircase-steps
+    Term.RawTermios.c_oflag := Term.OrigTermios.c_oflag;
     // Non-blocking single byte read via fpPoll
     Term.RawTermios.c_cc[VMIN] := 0;
     Term.RawTermios.c_cc[VTIME] := 0;
     TCSetAttr(STDIN_FILENO, TCSANOW, Term.RawTermios);
 
-    // Switch to alternate screen and hide cursor
+    // Switch to alternate screen, disable line wrap (DECAWM), clear, and hide cursor
     BufClear(GFrameBuf);
-    BufAppendStr(GFrameBuf, CSI_ALT_SCREEN_ON + CSI_CURSOR_HIDE);
+    BufAppendStr(GFrameBuf, CSI_ALT_SCREEN_ON + CSI_AUTOWRAP_OFF + CSI_CLEAR_ALL + CSI_HOME + CSI_CURSOR_HIDE);
     BufFlush(GFrameBuf);
   end;
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  hIn := GetStdHandle(STD_INPUT_HANDLE);
+  hOut := GetStdHandle(STD_OUTPUT_HANDLE);
+  Term.OrigInMode := 0;
+  Term.OrigOutMode := 0;
+  Term.IsTTY := GetConsoleMode(hIn, Term.OrigInMode) and GetConsoleMode(hOut, Term.OrigOutMode);
+  if Term.IsTTY then
+  begin
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+    SetConsoleMode(hOut, Term.OrigOutMode or ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    SetConsoleMode(hIn, (Term.OrigInMode and (not (ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT))) or ENABLE_VIRTUAL_TERMINAL_INPUT);
+    BufClear(GFrameBuf);
+    BufAppendStr(GFrameBuf, CSI_ALT_SCREEN_ON + CSI_AUTOWRAP_OFF + CSI_CLEAR_ALL + CSI_HOME + CSI_CURSOR_HIDE);
+    BufFlush(GFrameBuf);
+  end;
+  {$ENDIF}
   TermUpdateSize(Term);
 end;
 
@@ -275,10 +468,22 @@ begin
   if Term.IsTTY then
   begin
     BufClear(GFrameBuf);
-    BufAppendStr(GFrameBuf, CSI_CURSOR_SHOW + CSI_ALT_SCREEN_OFF + CSI_RESET);
+    BufAppendStr(GFrameBuf, CSI_CURSOR_SHOW + CSI_AUTOWRAP_ON + CSI_ALT_SCREEN_OFF + CSI_RESET);
     BufFlush(GFrameBuf);
+    {$IFDEF UNIX}
     TCSetAttr(STDIN_FILENO, TCSANOW, Term.OrigTermios);
+    {$ENDIF}
+    {$IFDEF WINDOWS}
+    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), Term.OrigInMode);
+    SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), Term.OrigOutMode);
+    {$ENDIF}
   end;
+end;
+
+procedure SetStatusMessage(const Msg: string; DurationMs: Int64 = 4000);
+begin
+  GStatusMsg := Msg;
+  GStatusExpireTick := GetTickCount64 + DurationMs;
 end;
 
 // =============================================================================
@@ -308,63 +513,261 @@ begin
   end;
 end;
 
-procedure DrainSocketReplies;
+function GetSourceLabel(ASourceIdx: Integer): string;
+begin
+  case ASourceIdx of
+    1: Result := 'NetEase Cloud (WY)';
+    2: Result := 'Bilibili Audio (BILI)';
+    3: Result := 'Apple Music (AM)';
+    4: Result := 'QQ Music (QQ)';
+    else Result := 'Local Library';
+  end;
+end;
+
+function GetSourcePrefix(ASourceIdx: Integer): string;
+begin
+  case ASourceIdx of
+    1: Result := 'netease:';
+    2: Result := 'bilibili:';
+    3: Result := 'am:';
+    4: Result := 'qq:';
+    else Result := '';
+  end;
+end;
+
+procedure RebuildFilteredList(Lib: TOMMLibraryEngine);
 var
-  drainBuf: array[0..1055] of Byte;
+  i, n, matchCount: Cardinal;
+  q, sTitle, sArtist, sAlbum: string;
+  pRec: POMMTrackRecord;
+begin
+  if (Lib = nil) or (not Lib.IsOpen) then
+  begin
+    SetLength(GFilteredIndices, 0);
+    GFilteredCount := 0;
+    Exit;
+  end;
+  n := Lib.TrackCount;
+  q := LowerCase(Trim(StrPas(@GFilterBuf[0])));
+  SetLength(GFilteredIndices, n);
+  matchCount := 0;
+  if n > 0 then
+  begin
+    for i := 0 to n - 1 do
+    begin
+      if q = '' then
+      begin
+        GFilteredIndices[matchCount] := i;
+        Inc(matchCount);
+      end
+      else
+      begin
+        pRec := Lib.GetRecordByIndex(i);
+        if pRec <> nil then
+        begin
+          sTitle  := LowerCase(StrPas(@pRec^.Title[0]));
+          sArtist := LowerCase(StrPas(@pRec^.Artist[0]));
+          sAlbum  := LowerCase(StrPas(@pRec^.Album[0]));
+          if (Pos(q, sTitle) > 0) or (Pos(q, sArtist) > 0) or (Pos(q, sAlbum) > 0) then
+          begin
+            GFilteredIndices[matchCount] := i;
+            Inc(matchCount);
+          end;
+        end;
+      end;
+    end;
+  end;
+  SetLength(GFilteredIndices, matchCount);
+  GFilteredCount := matchCount;
+  if GSelectedTrackIdx >= GFilteredCount then
+    GSelectedTrackIdx := 0;
+  if GViewportTopIdx >= GFilteredCount then
+    GViewportTopIdx := 0;
+end;
+
+procedure PollSocketPackets;
+var
+  pkt: TOMMPacket;
+  res: cint;
 begin
   if FSocketFD < 0 then Exit;
-  while fpRead(FSocketFD, @drainBuf[0], SizeOf(drainBuf)) > 0 do ;
+  repeat
+    res := RecvPacketNonBlocking(FSocketFD, pkt);
+    if res = 1 then
+    begin
+      case pkt.Opcode of
+        OP_RESP_MINERAL_SEARCH_HEADER:
+        begin
+          GIsOnlineMode := True;
+          GOnlineSearching := False;
+          GOnlineTrackCount := 0;
+          GSelectedTrackIdx := 0;
+          GViewportTopIdx := 0;
+          GLastPlayedOnlineIdx := -1;
+          if pkt.StatusCode < 0 then
+            SetStatusMessage('Search error (' + IntToStr(pkt.StatusCode) + ') on ' + GetSourceLabel(GSourceIdx), 5000)
+          else if pkt.Payload.ReturnedCount = 0 then
+            SetStatusMessage('No tracks found for "' + StrPas(@GSearchBuf[0]) + '" on ' + GetSourceLabel(GSourceIdx), 4000)
+          else
+            SetStatusMessage('Found ' + IntToStr(pkt.Payload.ReturnedCount) + ' tracks on ' + GetSourceLabel(GSourceIdx), 3000);
+        end;
+        OP_RESP_MINERAL_SEARCH_ITEM:
+        begin
+          GIsOnlineMode := True;
+          GOnlineSearching := False;
+          if GOnlineTrackCount < MAX_ONLINE_TRACKS then
+          begin
+            Move(pkt.Payload.TrackItem, GOnlineTracks[GOnlineTrackCount], SizeOf(TOMMCondensedTrack));
+            Inc(GOnlineTrackCount);
+          end;
+        end;
+        OP_RESP_ERROR:
+        begin
+          if pkt.Payload.ErrorCode = OMM_ERR_AUTH_REQUIRED then
+            SetStatusMessage('Auth required (VIP/Cookie needed for this stream)', 5000)
+          else
+            SetStatusMessage('Playback/IPC Error (' + IntToStr(pkt.Payload.ErrorCode) + ')', 4000);
+        end;
+      end;
+    end
+    else if res < 0 then
+    begin
+      fpClose(FSocketFD);
+      FSocketFD := -1;
+      Break;
+    end;
+  until res <= 0;
+end;
+
+function SendSafePacket(const Packet: TOMMPacket): Boolean;
+begin
+  Result := False;
+  if FSocketFD < 0 then
+    ConnectToDaemon;
+  if FSocketFD >= 0 then
+  begin
+    PollSocketPackets;
+    Result := SendPacket(FSocketFD, Packet);
+    if not Result then
+    begin
+      if ConnectToDaemon then
+        Result := SendPacket(FSocketFD, Packet);
+    end;
+  end;
 end;
 
 procedure SendCommand(Opcode: UInt16);
 var
   pkt: TOMMPacket;
 begin
-  if FSocketFD < 0 then
-    if not ConnectToDaemon then Exit;
-  DrainSocketReplies;
   Inc(GSeqCounter);
   InitPacket(pkt, Opcode, GSeqCounter);
-  SendPacket(FSocketFD, pkt);
+  SendSafePacket(pkt);
 end;
 
 procedure SendPlayTrack(TrackID: UInt32);
 var
   pkt: TOMMPacket;
 begin
-  if FSocketFD < 0 then
-    if not ConnectToDaemon then Exit;
-  DrainSocketReplies;
   Inc(GSeqCounter);
   InitPacket(pkt, OP_REQ_PLAY_TRACK_ID, GSeqCounter);
   pkt.Payload.TrackID := TrackID;
-  SendPacket(FSocketFD, pkt);
+  SendSafePacket(pkt);
+end;
+
+procedure SendPlayURI(const AURI: string);
+var
+  pkt: TOMMPacket;
+  len: Integer;
+begin
+  if AURI = '' then Exit;
+  Inc(GSeqCounter);
+  InitPacket(pkt, OP_REQ_PLAY_URI, GSeqCounter);
+  len := Min(Length(AURI), 479);
+  Move(AURI[1], pkt.Payload.URI[0], len);
+  SendSafePacket(pkt);
+end;
+
+procedure RenderFrame(const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine); forward;
+
+procedure SendMineralOnlineSearch(const AQuery: string; const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine);
+var
+  pkt: TOMMPacket;
+  q, fullQuery: string;
+  len: Integer;
+begin
+  q := Trim(AQuery);
+  if Pos('netease:', q) = 1 then
+  begin
+    GSourceIdx := 1;
+    q := Trim(Copy(q, 9, 255));
+  end
+  else if Pos('bilibili:', q) = 1 then
+  begin
+    GSourceIdx := 2;
+    q := Trim(Copy(q, 10, 255));
+  end
+  else if Pos('am:', q) = 1 then
+  begin
+    GSourceIdx := 3;
+    q := Trim(Copy(q, 4, 255));
+  end
+  else if Pos('qq:', q) = 1 then
+  begin
+    GSourceIdx := 4;
+    q := Trim(Copy(q, 4, 255));
+  end
+  else if GSourceIdx = 0 then
+    GSourceIdx := 1;
+
+  if q = '' then Exit;
+
+  len := Min(Length(q), 125);
+  Move(q[1], GSearchBuf[0], len);
+  GSearchBuf[len] := #0;
+  GSearchLen := len;
+
+  GIsOnlineMode := True;
+  GOnlineSearching := True;
+  GOnlineTrackCount := 0;
+  GSelectedTrackIdx := 0;
+  GViewportTopIdx := 0;
+  GLastPlayedOnlineIdx := -1;
+  SetStatusMessage('Searching ' + GetSourceLabel(GSourceIdx) + ' for "' + q + '"...', 10000);
+
+  // Immediately render searching state before blocking daemon request completes
+  if GTerm.IsTTY then
+  begin
+    TermUpdateSize(GTerm);
+    RenderFrame(Snap, Lib);
+  end;
+
+  fullQuery := GetSourcePrefix(GSourceIdx) + q;
+  Inc(GSeqCounter);
+  InitPacket(pkt, OP_REQ_MINERAL_SEARCH, GSeqCounter);
+  len := Min(Length(fullQuery), 479);
+  Move(fullQuery[1], pkt.Payload.URI[0], len);
+  SendSafePacket(pkt);
 end;
 
 procedure SendSeek(TargetMs: UInt32);
 var
   pkt: TOMMPacket;
 begin
-  if FSocketFD < 0 then
-    if not ConnectToDaemon then Exit;
-  DrainSocketReplies;
   Inc(GSeqCounter);
   InitPacket(pkt, OP_REQ_SEEK, GSeqCounter);
   pkt.Payload.TargetMs := TargetMs;
-  SendPacket(FSocketFD, pkt);
+  SendSafePacket(pkt);
 end;
 
 procedure SendSetVolume(Vol: Single);
 var
   pkt: TOMMPacket;
 begin
-  if FSocketFD < 0 then
-    if not ConnectToDaemon then Exit;
-  DrainSocketReplies;
   Inc(GSeqCounter);
   InitPacket(pkt, OP_REQ_SET_VOLUME, GSeqCounter);
   pkt.Payload.Volume := Vol;
-  SendPacket(FSocketFD, pkt);
+  SendSafePacket(pkt);
 end;
 
 function ReadSHMSnapshot(pShm: POMMSharedMemory; out Snap: TLocalPlaybackSnapshot): Boolean;
@@ -413,73 +816,139 @@ begin
 end;
 
 // =============================================================================
-// Screen Rendering
+// Screen Rendering (Explicit Row-by-Row Positioning, Zero Scroll, Zero Ghost)
 // =============================================================================
 
-procedure RenderSpectrumRow(var Buf: TFrameBuffer; const Snap: TLocalPlaybackSnapshot;
-  Row: Integer; Width: Integer; AsciiMode: Boolean);
+procedure BufGotoXY(var Buf: TFrameBuffer; Row, Col: Integer);
+begin
+  if Row < 1 then Row := 1;
+  if Col < 1 then Col := 1;
+  BufAppendStr(Buf, #27'[');
+  BufAppendInt(Buf, Row, 1);
+  BufAppendChar(Buf, ';');
+  BufAppendInt(Buf, Col, 1);
+  BufAppendChar(Buf, 'H');
+end;
+
+procedure BufGotoCol(var Buf: TFrameBuffer; Col: Integer);
+begin
+  if Col < 1 then Col := 1;
+  BufAppendStr(Buf, #27'[');
+  BufAppendInt(Buf, Col, 1);
+  BufAppendChar(Buf, 'G');
+end;
+
+procedure BufStartRow(var Buf: TFrameBuffer; Row: Integer; const LeftBorder: string = '│ ');
+begin
+  BufGotoXY(Buf, Row, 1);
+  BufAppendStr(Buf, CSI_RESET + CSI_CLEAR_EOL + LeftBorder);
+end;
+
+procedure BufEndRow(var Buf: TFrameBuffer; Row, Width: Integer; const RightBorder: string = '│');
+begin
+  BufGotoXY(Buf, Row, Width);
+  BufAppendStr(Buf, CSI_RESET + RightBorder);
+end;
+
+procedure BufDrawHorizRule(var Buf: TFrameBuffer; Count: Integer);
+var
+  i: Integer;
+begin
+  for i := 1 to Count do
+    BufAppendStr(Buf, '─');
+end;
+
+procedure BufDrawSectionDivider(var Buf: TFrameBuffer; Row: Integer; const Title: string; Width: Integer);
+var
+  titleCols, prefixCols, remainCols: Integer;
+begin
+  BufGotoXY(Buf, Row, 1);
+  BufAppendStr(Buf, CSI_RESET + CSI_CLEAR_EOL);
+  if Title = '' then
+  begin
+    BufAppendStr(Buf, '├');
+    BufDrawHorizRule(Buf, Max(1, Width - 2));
+    BufGotoXY(Buf, Row, Width);
+    BufAppendStr(Buf, '┤');
+  end
+  else
+  begin
+    BufAppendStr(Buf, '├────── ' + CSI_BOLD_CYAN + Title + CSI_RESET + ' ');
+    titleCols := Utf8DisplayCols(Title);
+    prefixCols := 9 + titleCols;
+    remainCols := Max(1, Width - prefixCols - 1);
+    BufDrawHorizRule(Buf, remainCols);
+    BufGotoXY(Buf, Row, Width);
+    BufAppendStr(Buf, '┤');
+  end;
+end;
+
+procedure RenderSpectrumRow(var Buf: TFrameBuffer; TermRow: Integer; const Snap: TLocalPlaybackSnapshot;
+  SpecBandRow, SpecTotalRows, Width: Integer; AsciiMode: Boolean);
 var
   b, numBands, bandIdx: Integer;
-  barVal, peakVal: Integer;
+  barVal, peakVal, rowThreshold, nextThreshold, stepSize: Integer;
   colorCode: string;
 begin
-  numBands := Min(64, Width - 4);
-  if numBands < 10 then numBands := 10;
+  numBands := Max(16, Width - 4);
+  stepSize := Max(1, 64 div Max(1, SpecTotalRows));
+  rowThreshold := SpecBandRow * stepSize;
+  nextThreshold := (SpecBandRow + 1) * stepSize;
 
-  // Vertical color gradient
-  if Row >= 6 then colorCode := CSI_BOLD_RED
-  else if Row >= 4 then colorCode := CSI_BOLD_YELLOW
-  else if Row >= 2 then colorCode := CSI_CYAN
+  if SpecBandRow * 4 >= SpecTotalRows * 3 then colorCode := CSI_BOLD_RED
+  else if SpecBandRow * 2 >= SpecTotalRows then colorCode := CSI_BOLD_YELLOW
+  else if SpecBandRow * 4 >= SpecTotalRows then colorCode := CSI_CYAN
   else colorCode := CSI_GREEN;
 
-  BufAppendStr(Buf, ' │ ' + colorCode);
+  BufStartRow(Buf, TermRow, '│ ' + colorCode);
 
   for b := 0 to numBands - 1 do
   begin
     bandIdx := (b * 64) div numBands;
+    if bandIdx > 63 then bandIdx := 63;
     barVal := Snap.QuantizedBars[bandIdx];
     peakVal := Snap.QuantizedPeaks[bandIdx];
 
     if AsciiMode then
     begin
-      if barVal >= (Row + 1) * 8 then
+      if barVal >= nextThreshold then
         BufAppendChar(Buf, '#')
-      else if barVal > Row * 8 then
+      else if barVal > rowThreshold then
         BufAppendChar(Buf, '*')
-      else if (peakVal >= Row * 8) and (peakVal < (Row + 1) * 8) then
+      else if (peakVal >= rowThreshold) and (peakVal < nextThreshold) then
         BufAppendChar(Buf, '-')
       else
         BufAppendChar(Buf, ' ');
     end
     else
     begin
-      if barVal >= (Row + 1) * 8 then
+      if barVal >= nextThreshold then
         BufAppendStr(Buf, UTF8_BARS[8])
-      else if barVal > Row * 8 then
-        BufAppendStr(Buf, UTF8_BARS[barVal - Row * 8])
-      else if (peakVal >= Row * 8) and (peakVal < (Row + 1) * 8) then
+      else if barVal > rowThreshold then
+        BufAppendStr(Buf, UTF8_BARS[EnsureRange(((barVal - rowThreshold) * 8) div stepSize, 1, 8)])
+      else if (peakVal >= rowThreshold) and (peakVal < nextThreshold) then
         BufAppendStr(Buf, CSI_BOLD_WHITE + UTF8_PEAK + colorCode)
       else
         BufAppendChar(Buf, ' ');
     end;
   end;
 
-  BufAppendStr(Buf, CSI_RESET + ' │' + CSI_CLEAR_EOL + #10);
+  BufEndRow(Buf, TermRow, Width);
 end;
 
-procedure RenderProgressBar(var Buf: TFrameBuffer; PosMs, DurMs: UInt32; Width: Integer);
+procedure RenderProgressBar(var Buf: TFrameBuffer; TermRow: Integer; PosMs, DurMs: UInt32; Width: Integer);
 var
   barWidth, filled, i: Integer;
   pct: Integer;
 begin
-  barWidth := Max(10, Width - 32);
+  BufStartRow(Buf, TermRow, '│ [');
+  barWidth := Max(10, Width - 28);
   if DurMs > 0 then
-    pct := Min(100, (PosMs * 100) div DurMs)
+    pct := Min(100, (Int64(PosMs) * 100) div DurMs)
   else
     pct := 0;
 
   filled := (pct * barWidth) div 100;
-  BufAppendStr(Buf, ' [');
   BufAppendTime(Buf, PosMs);
   BufAppendStr(Buf, ' / ');
   BufAppendTime(Buf, DurMs);
@@ -492,7 +961,8 @@ begin
     BufAppendChar(Buf, '-');
   BufAppendStr(Buf, '] ');
   BufAppendInt(Buf, pct, 2);
-  BufAppendStr(Buf, '%' + CSI_CLEAR_EOL + #10);
+  BufAppendChar(Buf, '%');
+  BufEndRow(Buf, TermRow, Width);
 end;
 
 procedure RenderVolumeBar(var Buf: TFrameBuffer; Vol: Single);
@@ -516,49 +986,82 @@ begin
   BufAppendChar(Buf, '%');
 end;
 
+function ViewportActiveCount(Lib: TOMMLibraryEngine): Cardinal;
+begin
+  if GIsOnlineMode then
+    Result := GOnlineTrackCount
+  else
+  begin
+    if (Lib <> nil) and Lib.IsOpen and (GFilterLen = 0) and (GFilteredCount <> Lib.TrackCount) then
+      RebuildFilteredList(Lib);
+    Result := GFilteredCount;
+  end;
+end;
+
 procedure RenderFrame(const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine);
 var
-  cols, rows, maxLibRows, r: Integer;
+  cols, rows, specRows, maxLibRows, curRow, r: Integer;
+  titleMaxLen, artistCol, albumCol, durCol, artistMaxLen, albumMaxLen: Integer;
   pRec: POMMTrackRecord;
-  tCount, trackIdx: Cardinal;
-  stateStr, pluginStr: string;
+  pOnline: ^TOMMCondensedTrack;
+  tCount, trackIdx, displayID, rowDurMs: Cardinal;
+  pTitle, pArtist, pAlbum: PAnsiChar;
+  isPlayingRow: Boolean;
+  stateStr, pluginStr, srcStr, vpTitle, hdrLeft, hdrRight: string;
+  dashCols: Integer;
 begin
   BufClear(GFrameBuf);
-  BufAppendStr(GFrameBuf, CSI_HOME);
 
-  cols := GTerm.Cols;
-  rows := GTerm.Rows;
+  cols := Max(60, Integer(GTerm.Cols));
+  rows := Max(20, Integer(GTerm.Rows));
+  if rows >= 26 then
+    specRows := 8
+  else
+    specRows := Max(2, rows - 18);
 
-  // Header line
-  BufAppendStr(GFrameBuf, CSI_BOLD_CYAN + '┌── Oh-Mini-Mineral Stateless Terminal Client v' + APP_VERSION + ' ──');
-  BufAppendSpaces(GFrameBuf, Max(0, cols - 56));
-  BufAppendStr(GFrameBuf, '[SHM 60 FPS] ──┐' + CSI_RESET + CSI_CLEAR_EOL + #10);
+  maxLibRows := Max(2, rows - 14 - specRows);
+  curRow := 1;
 
-  // Track metadata
-  BufAppendStr(GFrameBuf, '│ Title : ' + CSI_BOLD_WHITE);
+  // Row 1: Top Header Border
+  hdrLeft := ' Oh-Mini-Mineral Stateless Terminal Client v' + APP_VERSION + ' ';
+  hdrRight := ' [SHM 60 FPS] ';
+  dashCols := Max(2, cols - 4 - Utf8DisplayCols(hdrLeft) - Utf8DisplayCols(hdrRight));
+  BufGotoXY(GFrameBuf, curRow, 1);
+  BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + CSI_BOLD_CYAN + '┌──' + hdrLeft);
+  BufDrawHorizRule(GFrameBuf, dashCols);
+  BufGotoXY(GFrameBuf, curRow, Max(1, cols - Utf8DisplayCols(hdrRight) - 2));
+  BufAppendStr(GFrameBuf, hdrRight + '──┐' + CSI_RESET);
+  Inc(curRow);
+
+  // Row 2: Track Title
+  BufStartRow(GFrameBuf, curRow, '│ Title : ' + CSI_BOLD_WHITE);
   if Snap.TrackTitle[0] <> #0 then
-    BufAppendPChar(GFrameBuf, @Snap.TrackTitle[0], 128)
+    BufAppendUtf8Cols(GFrameBuf, @Snap.TrackTitle[0], 128, Max(20, cols - 12))
   else
     BufAppendStr(GFrameBuf, 'No track active');
-  BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + #10);
+  BufEndRow(GFrameBuf, curRow, cols);
+  Inc(curRow);
 
-  BufAppendStr(GFrameBuf, '│ Artist: ' + CSI_CYAN);
+  // Row 3: Artist & Album
+  BufStartRow(GFrameBuf, curRow, '│ Artist: ' + CSI_CYAN);
   if Snap.TrackArtist[0] <> #0 then
-    BufAppendPChar(GFrameBuf, @Snap.TrackArtist[0], 96)
+    BufAppendUtf8Cols(GFrameBuf, @Snap.TrackArtist[0], 128, Max(14, (cols - 28) div 2))
   else
     BufAppendStr(GFrameBuf, 'Unknown Artist');
-  BufAppendStr(GFrameBuf, CSI_RESET + '  Album: ' + CSI_YELLOW);
+  BufGotoCol(GFrameBuf, Max(28, cols div 2));
+  BufAppendStr(GFrameBuf, CSI_RESET + ' Album: ' + CSI_YELLOW);
   if Snap.TrackAlbum[0] <> #0 then
-    BufAppendPChar(GFrameBuf, @Snap.TrackAlbum[0], 96)
+    BufAppendUtf8Cols(GFrameBuf, @Snap.TrackAlbum[0], 128, Max(14, (cols div 2) - 11))
   else
     BufAppendStr(GFrameBuf, 'Unknown Album');
-  BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + #10);
+  BufEndRow(GFrameBuf, curRow, cols);
+  Inc(curRow);
 
-  // Progress Bar
-  BufAppendStr(GFrameBuf, '│');
-  RenderProgressBar(GFrameBuf, Snap.PositionMs, Snap.DurationMs, cols);
+  // Row 4: Progress Bar
+  RenderProgressBar(GFrameBuf, curRow, Snap.PositionMs, Snap.DurationMs, cols);
+  Inc(curRow);
 
-  // Status and State Line
+  // Row 5: Status, Volume, Source, and Plugin State
   case Snap.PlaybackState of
     0: stateStr := 'STOPPED';
     1: stateStr := 'PLAYING';
@@ -576,47 +1079,138 @@ begin
     else pluginStr := 'None';
   end;
 
-  BufAppendStr(GFrameBuf, '│ State: [' + CSI_BOLD + stateStr + CSI_RESET + ']   ');
+  srcStr := GetSourceLabel(GSourceIdx);
+
+  BufStartRow(GFrameBuf, curRow, '│ State: [' + CSI_BOLD + stateStr + CSI_RESET + ']  ');
   RenderVolumeBar(GFrameBuf, Snap.Volume);
-  BufAppendStr(GFrameBuf, '   Plugin: [' + CSI_CYAN + pluginStr + CSI_RESET + ']');
-  BufAppendStr(GFrameBuf, CSI_CLEAR_EOL + #10);
+  BufAppendStr(GFrameBuf, '  Source: [' + CSI_BOLD_YELLOW + srcStr + CSI_RESET + ']  Plugin: [' + CSI_CYAN + pluginStr + CSI_RESET + ']');
+  BufEndRow(GFrameBuf, curRow, cols);
+  Inc(curRow);
 
-  // 64-Band Real-Time Spectrum
-  BufAppendStr(GFrameBuf, '├────── 64-Band Real-Time Spectrum ────────────────────────────────────────────┤' + CSI_CLEAR_EOL + #10);
-  for r := 7 downto 0 do
-    RenderSpectrumRow(GFrameBuf, Snap, r, cols, GAsciiMode);
+  // Row 6: Spectrum Divider
+  BufDrawSectionDivider(GFrameBuf, curRow, '64-Band Real-Time Spectrum', cols);
+  Inc(curRow);
 
-  // Synchronized Lyrics Panel
-  BufAppendStr(GFrameBuf, '├────── Synchronized Lyrics ───────────────────────────────────────────────────┤' + CSI_CLEAR_EOL + #10);
-  BufAppendStr(GFrameBuf, '│ ♪ ' + CSI_BOLD_WHITE);
+  // Spectrum Rows
+  for r := specRows - 1 downto 0 do
+  begin
+    RenderSpectrumRow(GFrameBuf, curRow, Snap, r, specRows, cols, GAsciiMode);
+    Inc(curRow);
+  end;
+
+  // Synchronized Lyrics Divider & 2 Rows
+  BufDrawSectionDivider(GFrameBuf, curRow, 'Synchronized Lyrics', cols);
+  Inc(curRow);
+
+  BufStartRow(GFrameBuf, curRow, '│ ♪ ' + CSI_BOLD_WHITE);
   if Snap.LyricCurrent[0] <> #0 then
-    BufAppendPChar(GFrameBuf, @Snap.LyricCurrent[0], 255)
+    BufAppendUtf8Cols(GFrameBuf, @Snap.LyricCurrent[0], 256, Max(20, cols - 8))
   else
     BufAppendStr(GFrameBuf, '(...)');
-  BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + #10);
+  BufEndRow(GFrameBuf, curRow, cols);
+  Inc(curRow);
 
-  BufAppendStr(GFrameBuf, '│   ' + CSI_DIM);
+  BufStartRow(GFrameBuf, curRow, '│   ' + CSI_DIM);
   if Snap.LyricNext[0] <> #0 then
-    BufAppendPChar(GFrameBuf, @Snap.LyricNext[0], 255);
-  BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + #10);
+    BufAppendUtf8Cols(GFrameBuf, @Snap.LyricNext[0], 256, Max(20, cols - 8));
+  BufEndRow(GFrameBuf, curRow, cols);
+  Inc(curRow);
 
-  // Viewport Tracks
-  BufAppendStr(GFrameBuf, '├────── Library Viewport ──────────────────────────────────────────────────────┤' + CSI_CLEAR_EOL + #10);
-
-  tCount := 0;
-  if Lib <> nil then tCount := Lib.TrackCount;
-
-  maxLibRows := Max(3, rows - 20);
-  if GSelectedTrackIdx >= GViewportTopIdx + Cardinal(maxLibRows) then
-    GViewportTopIdx := GSelectedTrackIdx - Cardinal(maxLibRows) + 1;
-  if GSelectedTrackIdx < GViewportTopIdx then
-    GViewportTopIdx := GSelectedTrackIdx;
-
-  if (Lib = nil) or (tCount = 0) then
+  // Viewport Divider
+  tCount := ViewportActiveCount(Lib);
+  if GIsOnlineMode then
   begin
-    BufAppendStr(GFrameBuf, '│ [No library.bin found — press ' + CSI_BOLD_YELLOW + '''r''' + CSI_RESET + ' to trigger daemon rescan]' + CSI_CLEAR_EOL + #10);
+    vpTitle := 'Online Search - ' + GetSourceLabel(GSourceIdx);
+    if GSearchLen > 0 then
+      vpTitle := vpTitle + ' [' + IntToStr(tCount) + ' results]';
+  end
+  else
+  begin
+    vpTitle := 'Library Viewport - Local Library';
+    if GFilterLen > 0 then
+      vpTitle := vpTitle + ' [Filter: ' + IntToStr(tCount) + ' matches]'
+    else
+      vpTitle := vpTitle + ' [' + IntToStr(tCount) + ' tracks]';
+  end;
+  if (GStatusMsg <> '') and (GetTickCount64 < GStatusExpireTick) then
+    vpTitle := vpTitle + ' (' + GStatusMsg + ')';
+  BufDrawSectionDivider(GFrameBuf, curRow, vpTitle, cols);
+  Inc(curRow);
+
+  // Clamp selection and viewport scroll offset
+  if (tCount > 0) and (GSelectedTrackIdx >= tCount) then
+    GSelectedTrackIdx := tCount - 1;
+  if tCount = 0 then
+  begin
+    GSelectedTrackIdx := 0;
+    GViewportTopIdx := 0;
+  end
+  else
+  begin
+    if GSelectedTrackIdx >= GViewportTopIdx + Cardinal(maxLibRows) then
+      GViewportTopIdx := GSelectedTrackIdx - Cardinal(maxLibRows) + 1;
+    if GSelectedTrackIdx < GViewportTopIdx then
+      GViewportTopIdx := GSelectedTrackIdx;
+  end;
+
+  durCol := cols - 7;
+  if cols >= 100 then
+  begin
+    albumCol := cols - 34;
+    artistCol := cols - 58;
+    titleMaxLen := Max(14, artistCol - 13);
+    artistMaxLen := Max(10, albumCol - artistCol - 2);
+    albumMaxLen := Max(10, durCol - albumCol - 2);
+  end
+  else
+  begin
+    albumCol := 0;
+    artistCol := Max(34, cols - 30);
+    titleMaxLen := Max(12, artistCol - 13);
+    artistMaxLen := Max(8, durCol - artistCol - 2);
+    albumMaxLen := 0;
+  end;
+
+  if GIsOnlineMode and GOnlineSearching then
+  begin
+    BufStartRow(GFrameBuf, curRow, '│ ' + CSI_BOLD_YELLOW + '[Searching ' + GetSourceLabel(GSourceIdx) + ' for "' + StrPas(@GSearchBuf[0]) + '"...]' + CSI_RESET);
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
     for r := 1 to maxLibRows - 1 do
-      BufAppendStr(GFrameBuf, '│' + CSI_CLEAR_EOL + #10);
+    begin
+      BufStartRow(GFrameBuf, curRow, '│');
+      BufEndRow(GFrameBuf, curRow, cols);
+      Inc(curRow);
+    end;
+  end
+  else if GIsOnlineMode and (tCount = 0) then
+  begin
+    BufStartRow(GFrameBuf, curRow, '│ [Online Mode (' + CSI_BOLD_YELLOW + GetSourceLabel(GSourceIdx) + CSI_RESET + ') - press ' +
+      CSI_BOLD_CYAN + '''s''' + CSI_RESET + ' to search online tracks, or ' +
+      CSI_BOLD_CYAN + '''m''' + CSI_RESET + ' to switch source]');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
+    for r := 1 to maxLibRows - 1 do
+    begin
+      BufStartRow(GFrameBuf, curRow, '│');
+      BufEndRow(GFrameBuf, curRow, cols);
+      Inc(curRow);
+    end;
+  end
+  else if (not GIsOnlineMode) and ((Lib = nil) or (tCount = 0)) then
+  begin
+    if GFilterLen > 0 then
+      BufStartRow(GFrameBuf, curRow, '│ [No local tracks match filter "' + CSI_BOLD_YELLOW + StrPas(@GFilterBuf[0]) + CSI_RESET + '" - press ' + CSI_BOLD_CYAN + '''/''' + CSI_RESET + ' then Esc to clear]')
+    else
+      BufStartRow(GFrameBuf, curRow, '│ [No library.bin found - press ' + CSI_BOLD_YELLOW + '''r''' + CSI_RESET + ' to rescan local library, or ' + CSI_BOLD_CYAN + '''s''' + CSI_RESET + ' for online search]');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
+    for r := 1 to maxLibRows - 1 do
+    begin
+      BufStartRow(GFrameBuf, curRow, '│');
+      BufEndRow(GFrameBuf, curRow, cols);
+      Inc(curRow);
+    end;
   end
   else
   begin
@@ -625,51 +1219,147 @@ begin
       trackIdx := GViewportTopIdx + Cardinal(r);
       if trackIdx < tCount then
       begin
-        pRec := Lib.GetRecordByIndex(trackIdx);
-        if trackIdx = GSelectedTrackIdx then
+        pTitle := nil;
+        pArtist := nil;
+        pAlbum := nil;
+        displayID := trackIdx + 1;
+        rowDurMs := 0;
+        isPlayingRow := False;
+
+        if GIsOnlineMode then
         begin
-          BufAppendStr(GFrameBuf, '│ ' + CSI_REVERSE + CSI_BOLD_CYAN + '> ');
-          BufAppendInt(GFrameBuf, pRec^.TrackID, 4);
-          BufAppendStr(GFrameBuf, '. ');
-          BufAppendPChar(GFrameBuf, @pRec^.Title[0], 30);
-          BufAppendSpaces(GFrameBuf, Max(1, 32 - StrLen(pRec^.Title)));
-          BufAppendPChar(GFrameBuf, @pRec^.Artist[0], 20);
-          BufAppendSpaces(GFrameBuf, Max(1, 22 - StrLen(pRec^.Artist)));
-          BufAppendTime(GFrameBuf, pRec^.DurationMs);
-          BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + #10);
+          pOnline := @GOnlineTracks[trackIdx];
+          if pOnline^.TrackID > 10000 then
+            displayID := pOnline^.TrackID - 10000
+          else if pOnline^.TrackID > 0 then
+            displayID := pOnline^.TrackID;
+          pTitle := @pOnline^.Title[0];
+          pArtist := @pOnline^.Artist[0];
+          pAlbum := @pOnline^.Album[0];
+          rowDurMs := pOnline^.DurationMs;
+          isPlayingRow := (Snap.PlaybackState in [1, 2]) and
+            ((Integer(trackIdx) = GLastPlayedOnlineIdx) or
+             ((Snap.CurrentTrackID > 0) and (pOnline^.TrackID = Snap.CurrentTrackID)));
         end
         else
         begin
-          BufAppendStr(GFrameBuf, '│   ');
-          BufAppendInt(GFrameBuf, pRec^.TrackID, 4);
+          pRec := Lib.GetRecordByIndex(GFilteredIndices[trackIdx]);
+          if pRec <> nil then
+          begin
+            displayID := pRec^.TrackID;
+            pTitle := @pRec^.Title[0];
+            pArtist := @pRec^.Artist[0];
+            pAlbum := @pRec^.Album[0];
+            rowDurMs := pRec^.DurationMs;
+            isPlayingRow := (Snap.PlaybackState in [1, 2]) and (Snap.CurrentTrackID = pRec^.TrackID);
+          end;
+        end;
+
+        if trackIdx = GSelectedTrackIdx then
+        begin
+          BufStartRow(GFrameBuf, curRow, '│ ' + CSI_REVERSE + CSI_BOLD_CYAN);
+          BufAppendSpaces(GFrameBuf, Max(1, cols - 3));
+          BufGotoXY(GFrameBuf, curRow, 3);
+          if isPlayingRow then
+            BufAppendStr(GFrameBuf, '▶ ')
+          else
+            BufAppendStr(GFrameBuf, '> ');
+          BufAppendInt(GFrameBuf, displayID, 4);
           BufAppendStr(GFrameBuf, '. ');
-          BufAppendPChar(GFrameBuf, @pRec^.Title[0], 30);
-          BufAppendSpaces(GFrameBuf, Max(1, 32 - StrLen(pRec^.Title)));
-          BufAppendStr(GFrameBuf, CSI_DIM);
-          BufAppendPChar(GFrameBuf, @pRec^.Artist[0], 20);
-          BufAppendStr(GFrameBuf, CSI_RESET);
-          BufAppendSpaces(GFrameBuf, Max(1, 22 - StrLen(pRec^.Artist)));
-          BufAppendTime(GFrameBuf, pRec^.DurationMs);
-          BufAppendStr(GFrameBuf, CSI_CLEAR_EOL + #10);
+          if pTitle <> nil then
+            BufAppendUtf8Cols(GFrameBuf, pTitle, 128, titleMaxLen);
+          BufGotoXY(GFrameBuf, curRow, artistCol);
+          if pArtist <> nil then
+            BufAppendUtf8Cols(GFrameBuf, pArtist, 96, artistMaxLen);
+          if albumCol > 0 then
+          begin
+            BufGotoXY(GFrameBuf, curRow, albumCol);
+            if pAlbum <> nil then
+              BufAppendUtf8Cols(GFrameBuf, pAlbum, 96, albumMaxLen);
+          end;
+          BufGotoXY(GFrameBuf, curRow, durCol);
+          BufAppendTime(GFrameBuf, rowDurMs);
+          BufEndRow(GFrameBuf, curRow, cols);
+        end
+        else
+        begin
+          if isPlayingRow then
+            BufStartRow(GFrameBuf, curRow, '│ ' + CSI_BOLD_GREEN + '♪ ')
+          else
+            BufStartRow(GFrameBuf, curRow, '│   ');
+          BufAppendInt(GFrameBuf, displayID, 4);
+          BufAppendStr(GFrameBuf, '. ');
+          if pTitle <> nil then
+            BufAppendUtf8Cols(GFrameBuf, pTitle, 128, titleMaxLen);
+          BufGotoXY(GFrameBuf, curRow, artistCol);
+          if isPlayingRow then
+            BufAppendStr(GFrameBuf, CSI_BOLD_GREEN)
+          else
+            BufAppendStr(GFrameBuf, CSI_DIM);
+          if pArtist <> nil then
+            BufAppendUtf8Cols(GFrameBuf, pArtist, 96, artistMaxLen);
+          if albumCol > 0 then
+          begin
+            BufGotoXY(GFrameBuf, curRow, albumCol);
+            if pAlbum <> nil then
+              BufAppendUtf8Cols(GFrameBuf, pAlbum, 96, albumMaxLen);
+          end;
+          BufGotoXY(GFrameBuf, curRow, durCol);
+          if not isPlayingRow then
+            BufAppendStr(GFrameBuf, CSI_RESET);
+          BufAppendTime(GFrameBuf, rowDurMs);
+          BufEndRow(GFrameBuf, curRow, cols);
         end;
       end
       else
-        BufAppendStr(GFrameBuf, '│' + CSI_CLEAR_EOL + #10);
+      begin
+        BufStartRow(GFrameBuf, curRow, '│');
+        BufEndRow(GFrameBuf, curRow, cols);
+      end;
+      Inc(curRow);
     end;
   end;
 
-  // Controls Footer
-  BufAppendStr(GFrameBuf, '├──────────────────────────────────────────────────────────────────────────────┤' + CSI_CLEAR_EOL + #10);
-  if GFilterActive then
+  // Controls Footer (Pinned to bottom 4 rows: rows - 3 .. rows)
+  curRow := rows - 3;
+  BufDrawSectionDivider(GFrameBuf, curRow, '', cols);
+  Inc(curRow);
+
+  if GInputMode = imOnlineSearch then
   begin
-    BufAppendStr(GFrameBuf, '│ Search: ' + CSI_BOLD_YELLOW + StrPas(@GFilterBuf[0]) + '_' + CSI_RESET + ' [Enter/Esc]' + CSI_CLEAR_EOL + #10);
+    BufStartRow(GFrameBuf, curRow, '│ Online Search (' + CSI_BOLD_CYAN + GetSourceLabel(IfThen(GSourceIdx = 0, 1, GSourceIdx)) + CSI_RESET + '): ' +
+      CSI_BOLD_YELLOW + StrPas(@GSearchBuf[0]) + '_' + CSI_RESET + '  [Enter] Search  [Esc] Cancel');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
+    BufStartRow(GFrameBuf, curRow, '│ Tip: Prefix with netease: / bilibili: / am: / qq: or press [m] after Esc to switch platform');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
+  end
+  else if GInputMode = imLocalFilter then
+  begin
+    BufStartRow(GFrameBuf, curRow, '│ Local Filter: ' + CSI_BOLD_YELLOW + StrPas(@GFilterBuf[0]) + '_' + CSI_RESET + '  [Enter] Confirm  [Esc] Clear Filter');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
+    BufStartRow(GFrameBuf, curRow, '│ Type to filter local library in real-time by Title, Artist, or Album  [↑/↓] Select Track');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
   end
   else
   begin
-    BufAppendStr(GFrameBuf, '│ [Space] Play/Pause [s] Stop [Enter] Play Track [←/→] Seek [↑/↓] Vol' + CSI_CLEAR_EOL + #10);
-    BufAppendStr(GFrameBuf, '│ [j/k] Navigate [/] Filter [r] Rescan [w] Wake [z] Suspend [q] Quit' + CSI_CLEAR_EOL + #10);
+    BufStartRow(GFrameBuf, curRow, '│ [Space] Play/Pause  [s] Search  [m] Source  [x] Stop  [Enter] Play  [n/p] Next/Prev  [←/→] Seek  [+/-] Vol');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
+    BufStartRow(GFrameBuf, curRow, '│ [↑/↓ or j/k] Navigate  [PgUp/PgDn] Page  [/] Filter  [r] Rescan  [w] Wake  [z] Suspend  [q] Quit');
+    BufEndRow(GFrameBuf, curRow, cols);
+    Inc(curRow);
   end;
-  BufAppendStr(GFrameBuf, '└──────────────────────────────────────────────────────────────────────────────┘' + CSI_CLEAR_EOL);
+
+  // Final Row (Row = rows): Bottom Border without newline so terminal never scrolls!
+  BufGotoXY(GFrameBuf, rows, 1);
+  BufAppendStr(GFrameBuf, CSI_RESET + CSI_CLEAR_EOL + CSI_BOLD_CYAN + '└');
+  BufDrawHorizRule(GFrameBuf, Max(1, cols - 2));
+  BufGotoXY(GFrameBuf, rows, cols);
+  BufAppendStr(GFrameBuf, '┘' + CSI_RESET);
 
   BufFlush(GFrameBuf);
 end;
@@ -678,32 +1368,158 @@ end;
 // Input Processing
 // =============================================================================
 
+procedure PopUtf8Char(var Buf: array of AnsiChar; var Len: Integer);
+begin
+  if Len <= 0 then Exit;
+  while (Len > 0) and ((Ord(Buf[Len - 1]) and $C0) = $80) do
+    Dec(Len);
+  if Len > 0 then
+    Dec(Len);
+  Buf[Len] := #0;
+end;
+
+procedure PlayTrackAtIndex(Idx: Cardinal; const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine);
+var
+  tCount: Cardinal;
+  pRec: POMMTrackRecord;
+  uri, titleStr: string;
+begin
+  tCount := ViewportActiveCount(Lib);
+  if (tCount = 0) or (Idx >= tCount) then Exit;
+  GSelectedTrackIdx := Idx;
+
+  if GIsOnlineMode then
+  begin
+    uri := StrPas(@GOnlineTracks[Idx].URI[0]);
+    titleStr := StrPas(@GOnlineTracks[Idx].Title[0]);
+    if uri <> '' then
+    begin
+      GLastPlayedOnlineIdx := Integer(Idx);
+      SetStatusMessage('Loading stream: ' + titleStr, 4000);
+      if GTerm.IsTTY then
+      begin
+        TermUpdateSize(GTerm);
+        RenderFrame(Snap, Lib);
+      end;
+      SendPlayURI(uri);
+    end;
+  end
+  else if Lib <> nil then
+  begin
+    pRec := Lib.GetRecordByIndex(GFilteredIndices[Idx]);
+    if pRec <> nil then
+    begin
+      SetStatusMessage('Playing: ' + StrPas(@pRec^.Title[0]), 3000);
+      SendPlayTrack(pRec^.TrackID);
+    end;
+  end;
+end;
+
+procedure ProcessVirtualKey(VKey: TVirtualKey; const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine);
+var
+  tCount: Cardinal;
+begin
+  tCount := ViewportActiveCount(Lib);
+  case VKey of
+    vkUp:
+      if GSelectedTrackIdx > 0 then Dec(GSelectedTrackIdx);
+    vkDown:
+      if (tCount > 0) and (GSelectedTrackIdx < tCount - 1) then Inc(GSelectedTrackIdx);
+    vkPgUp:
+      if GSelectedTrackIdx > 10 then Dec(GSelectedTrackIdx, 10) else GSelectedTrackIdx := 0;
+    vkPgDn:
+      if (tCount > 0) and (GSelectedTrackIdx + 10 < tCount) then
+        Inc(GSelectedTrackIdx, 10)
+      else if tCount > 0 then
+        GSelectedTrackIdx := tCount - 1
+      else
+        GSelectedTrackIdx := 0;
+    vkHome:
+      GSelectedTrackIdx := 0;
+    vkEnd:
+      if tCount > 0 then GSelectedTrackIdx := tCount - 1 else GSelectedTrackIdx := 0;
+    vkLeft:
+      if GInputMode = imNone then
+      begin
+        if Snap.PositionMs > 5000 then
+          SendSeek(Snap.PositionMs - 5000)
+        else
+          SendSeek(0);
+      end;
+    vkRight:
+      if GInputMode = imNone then
+      begin
+        if Snap.DurationMs > Snap.PositionMs + 5000 then
+          SendSeek(Snap.PositionMs + 5000)
+        else if Snap.DurationMs > 0 then
+          SendSeek(Snap.DurationMs);
+      end;
+    vkDelete:
+      if GInputMode = imOnlineSearch then
+        PopUtf8Char(GSearchBuf, GSearchLen)
+      else if GInputMode = imLocalFilter then
+      begin
+        PopUtf8Char(GFilterBuf, GFilterLen);
+        RebuildFilteredList(Lib);
+      end;
+  end;
+end;
+
 procedure ProcessKey(Key: Char; const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine);
 var
   tCount: Cardinal;
 begin
-  tCount := 0;
-  if Lib <> nil then tCount := Lib.TrackCount;
+  tCount := ViewportActiveCount(Lib);
 
-  if GFilterActive then
+  if GInputMode = imOnlineSearch then
   begin
-    if (Key = #13) or (Key = #27) then // Enter or Esc closes search
+    if (Key = #13) or (Key = #10) then
     begin
-      GFilterActive := False;
+      GInputMode := imNone;
+      if GSearchLen > 0 then
+        SendMineralOnlineSearch(StrPas(@GSearchBuf[0]), Snap, Lib);
     end
-    else if (Key = #8) or (Key = #127) then // Backspace
+    else if Key = #27 then
     begin
-      if GFilterLen > 0 then
-      begin
-        Dec(GFilterLen);
-        GFilterBuf[GFilterLen] := #0;
-      end;
+      GInputMode := imNone;
     end
-    else if (Key >= ' ') and (Key <= '~') and (GFilterLen < 125) then
+    else if (Key = #8) or (Key = #127) then
+    begin
+      PopUtf8Char(GSearchBuf, GSearchLen);
+    end
+    else if (Ord(Key) >= 32) and (Ord(Key) <> 127) and (GSearchLen < 125) then
+    begin
+      GSearchBuf[GSearchLen] := Key;
+      Inc(GSearchLen);
+      GSearchBuf[GSearchLen] := #0;
+    end;
+    Exit;
+  end;
+
+  if GInputMode = imLocalFilter then
+  begin
+    if (Key = #13) or (Key = #10) then
+    begin
+      GInputMode := imNone;
+    end
+    else if Key = #27 then
+    begin
+      GInputMode := imNone;
+      GFilterLen := 0;
+      GFilterBuf[0] := #0;
+      RebuildFilteredList(Lib);
+    end
+    else if (Key = #8) or (Key = #127) then
+    begin
+      PopUtf8Char(GFilterBuf, GFilterLen);
+      RebuildFilteredList(Lib);
+    end
+    else if (Ord(Key) >= 32) and (Ord(Key) <> 127) and (GFilterLen < 125) then
     begin
       GFilterBuf[GFilterLen] := Key;
       Inc(GFilterLen);
       GFilterBuf[GFilterLen] := #0;
+      RebuildFilteredList(Lib);
     end;
     Exit;
   end;
@@ -718,115 +1534,193 @@ begin
         SendCommand(OP_REQ_PAUSE)
       else if Snap.PlaybackState = 2 then
         SendCommand(OP_REQ_RESUME)
+      else if tCount > 0 then
+        PlayTrackAtIndex(GSelectedTrackIdx, Snap, Lib)
       else
         SendCommand(OP_REQ_PLAY);
     end;
 
-    's', 'S': // Stop
-      SendCommand(OP_REQ_STOP);
-
-    #13: // Enter: Play highlighted track
+    's': // Online Search
     begin
-      if (Lib <> nil) and (tCount > 0) and (GSelectedTrackIdx < tCount) then
+      if GSourceIdx = 0 then
+        GSourceIdx := 1;
+      GIsOnlineMode := True;
+      GInputMode := imOnlineSearch;
+      GSearchLen := 0;
+      GSearchBuf[0] := #0;
+    end;
+
+    'm', 'M': // Switch Source (0=Local -> 1=NetEase -> 2=Bilibili -> 3=AppleMusic -> 4=QQMusic)
+    begin
+      GSourceIdx := (GSourceIdx + 1) mod 5;
+      if GSourceIdx = 0 then
       begin
-        if Lib.GetRecordByIndex(GSelectedTrackIdx) <> nil then
-          SendPlayTrack(Lib.GetRecordByIndex(GSelectedTrackIdx)^.TrackID)
+        GIsOnlineMode := False;
+        GOnlineSearching := False;
+        RebuildFilteredList(Lib);
+        GSelectedTrackIdx := 0;
+        GViewportTopIdx := 0;
+        SetStatusMessage('Switched to Local Library', 2500);
+      end
+      else
+      begin
+        GIsOnlineMode := True;
+        SetStatusMessage('Switched source to ' + GetSourceLabel(GSourceIdx), 2500);
+        if GSearchLen > 0 then
+          SendMineralOnlineSearch(StrPas(@GSearchBuf[0]), Snap, Lib)
         else
-          SendPlayTrack(GSelectedTrackIdx + 1);
+        begin
+          GOnlineTrackCount := 0;
+          GSelectedTrackIdx := 0;
+          GViewportTopIdx := 0;
+        end;
       end;
     end;
 
-    'j', 'B': // Down
+    'x', 'X', 'S': // Stop
     begin
-      if (tCount > 0) and (GSelectedTrackIdx < tCount - 1) then
-        Inc(GSelectedTrackIdx);
+      SendCommand(OP_REQ_STOP);
+      SetStatusMessage('Playback stopped', 2000);
     end;
 
-    'k', 'A': // Up
+    #13, #10: // Enter: Play highlighted track
+      PlayTrackAtIndex(GSelectedTrackIdx, Snap, Lib);
+
+    'n', 'N', ']': // Next track
     begin
-      if GSelectedTrackIdx > 0 then
-        Dec(GSelectedTrackIdx);
+      if (tCount > 0) and (GSelectedTrackIdx + 1 < tCount) then
+        PlayTrackAtIndex(GSelectedTrackIdx + 1, Snap, Lib)
+      else if tCount > 0 then
+        PlayTrackAtIndex(0, Snap, Lib);
     end;
 
-    'h', 'D': // Seek backward 5s
+    'p', 'P', '[': // Previous track
     begin
-      if Snap.PositionMs > 5000 then
-        SendSeek(Snap.PositionMs - 5000)
-      else
-        SendSeek(0);
+      if (tCount > 0) and (GSelectedTrackIdx > 0) then
+        PlayTrackAtIndex(GSelectedTrackIdx - 1, Snap, Lib)
+      else if tCount > 0 then
+        PlayTrackAtIndex(tCount - 1, Snap, Lib);
     end;
 
-    'l', 'C': // Seek forward 5s
-    begin
-      if Snap.DurationMs > Snap.PositionMs + 5000 then
-        SendSeek(Snap.PositionMs + 5000)
-      else if Snap.DurationMs > 0 then
-        SendSeek(Snap.DurationMs);
-    end;
+    'j': // Down
+      ProcessVirtualKey(vkDown, Snap, Lib);
 
-    '+', '=': // Volume up 5%
-    begin
+    'k': // Up
+      ProcessVirtualKey(vkUp, Snap, Lib);
+
+    'g': // First track
+      ProcessVirtualKey(vkHome, Snap, Lib);
+
+    'G': // Last track
+      ProcessVirtualKey(vkEnd, Snap, Lib);
+
+    'h': // Seek backward 5s
+      ProcessVirtualKey(vkLeft, Snap, Lib);
+
+    'l': // Seek forward 5s
+      ProcessVirtualKey(vkRight, Snap, Lib);
+
+    '+', '=', '0': // Volume up 5%
       SendSetVolume(Min(1.0, Snap.Volume + 0.05));
-    end;
 
-    '-', '_': // Volume down 5%
-    begin
+    '-', '_', '9': // Volume down 5%
       SendSetVolume(Max(0.0, Snap.Volume - 0.05));
-    end;
 
     'r', 'R': // Rescan
+    begin
+      GSourceIdx := 0;
+      GIsOnlineMode := False;
+      SetStatusMessage('Rescanning local music library...', 3000);
       SendCommand(OP_REQ_RESCAN_LIBRARY);
+    end;
 
     'w', 'W': // Wake plugin
+    begin
+      SetStatusMessage('Waking up Mineral plugin...', 2500);
       SendCommand(OP_REQ_PLUGIN_WAKE);
+    end;
 
     'z', 'Z': // Suspend plugin
-      SendCommand(OP_REQ_PLUGIN_SUSPEND);
-
-    '/': // Search filter
     begin
-      GFilterActive := True;
+      SetStatusMessage('Suspending Mineral plugin (<0.3 MB)...', 2500);
+      SendCommand(OP_REQ_PLUGIN_SUSPEND);
+    end;
+
+    '/': // Local Filter
+    begin
+      GSourceIdx := 0;
+      GIsOnlineMode := False;
+      GInputMode := imLocalFilter;
       GFilterLen := 0;
       GFilterBuf[0] := #0;
+      RebuildFilteredList(Lib);
     end;
   end;
 end;
 
 procedure HandleInput(const Snap: TLocalPlaybackSnapshot; Lib: TOMMLibraryEngine);
 var
-  ch: AnsiChar;
-  seq: array[0..3] of AnsiChar;
-  n: ssize_t;
+  ch, c2, c3: AnsiChar;
+  n: {$IFDEF UNIX}ssize_t{$ELSE}TsSize{$ENDIF};
+  numCode: Integer;
 begin
   n := fpRead(STDIN_FILENO, @ch, 1);
   while n > 0 do
   begin
-    if ch = #27 then // Escape sequence
+    {$IFDEF WINDOWS}
+    if (ch = #0) or (ch = #$E0) then
     begin
-      n := fpRead(STDIN_FILENO, @seq[0], 2);
-      if n = 2 then
+      if fpRead(STDIN_FILENO, @c2, 1) = 1 then
       begin
-        if seq[0] = '[' then
+        case Ord(c2) of
+          72: ProcessVirtualKey(vkUp, Snap, Lib);
+          80: ProcessVirtualKey(vkDown, Snap, Lib);
+          77: ProcessVirtualKey(vkRight, Snap, Lib);
+          75: ProcessVirtualKey(vkLeft, Snap, Lib);
+          71: ProcessVirtualKey(vkHome, Snap, Lib);
+          79: ProcessVirtualKey(vkEnd, Snap, Lib);
+          73: ProcessVirtualKey(vkPgUp, Snap, Lib);
+          81: ProcessVirtualKey(vkPgDn, Snap, Lib);
+          83: ProcessVirtualKey(vkDelete, Snap, Lib);
+        end;
+      end;
+      n := fpRead(STDIN_FILENO, @ch, 1);
+      Continue;
+    end;
+    {$ENDIF}
+    if ch = #27 then // Escape or CSI/SS3 sequence
+    begin
+      if fpRead(STDIN_FILENO, @c2, 1) = 1 then
+      begin
+        if (c2 = '[') or (c2 = 'O') then
         begin
-          case seq[1] of
-            'A': ProcessKey('A', Snap, Lib); // Up
-            'B': ProcessKey('B', Snap, Lib); // Down
-            'C': ProcessKey('C', Snap, Lib); // Right
-            'D': ProcessKey('D', Snap, Lib); // Left
-            '5': // Page Up
-            begin
-              fpRead(STDIN_FILENO, @seq[2], 1); // consume ~
-              if GSelectedTrackIdx > 10 then Dec(GSelectedTrackIdx, 10) else GSelectedTrackIdx := 0;
-            end;
-            '6': // Page Down
-            begin
-              fpRead(STDIN_FILENO, @seq[2], 1); // consume ~
-              if (Lib <> nil) and (GSelectedTrackIdx + 10 < Lib.TrackCount) then
-                Inc(GSelectedTrackIdx, 10)
-              else if (Lib <> nil) and (Lib.TrackCount > 0) then
-                GSelectedTrackIdx := Lib.TrackCount - 1
-              else
-                GSelectedTrackIdx := 0;
+          if fpRead(STDIN_FILENO, @c3, 1) = 1 then
+          begin
+            case c3 of
+              'A': ProcessVirtualKey(vkUp, Snap, Lib);
+              'B': ProcessVirtualKey(vkDown, Snap, Lib);
+              'C': ProcessVirtualKey(vkRight, Snap, Lib);
+              'D': ProcessVirtualKey(vkLeft, Snap, Lib);
+              'H': ProcessVirtualKey(vkHome, Snap, Lib);
+              'F': ProcessVirtualKey(vkEnd, Snap, Lib);
+              '0'..'9':
+              begin
+                numCode := Ord(c3) - Ord('0');
+                while fpRead(STDIN_FILENO, @c3, 1) = 1 do
+                begin
+                  if (c3 >= '0') and (c3 <= '9') then
+                    numCode := numCode * 10 + (Ord(c3) - Ord('0'))
+                  else if (c3 >= '@') and (c3 <= '~') then
+                    Break;
+                end;
+                case numCode of
+                  1, 7: ProcessVirtualKey(vkHome, Snap, Lib);
+                  3:    ProcessVirtualKey(vkDelete, Snap, Lib);
+                  4, 8: ProcessVirtualKey(vkEnd, Snap, Lib);
+                  5:    ProcessVirtualKey(vkPgUp, Snap, Lib);
+                  6:    ProcessVirtualKey(vkPgDn, Snap, Lib);
+                end;
+              end;
             end;
           end;
         end;
@@ -926,10 +1820,11 @@ end;
 
 var
   snap: TLocalPlaybackSnapshot;
-  pollFds: array[0..1] of TPollFD;
+  pollFds: array[0..1] of {$IFDEF UNIX}TPollFD{$ELSE}pollfd{$ENDIF};
   lastTick, nowTick, sleepMs: Int64;
   pipeBuf: array[0..255] of AnsiChar;
-  pipeRead: ssize_t;
+  pipeRead: {$IFDEF UNIX}ssize_t{$ELSE}TsSize{$ENDIF};
+  waitIter: Integer;
 
 begin
   ParseCommandLine;
@@ -944,12 +1839,26 @@ begin
   // Open shared memory
   FPShm := OpenSharedMemory(GShmPath, True);
 
-  // Connect to IPC socket
-  ConnectToDaemon;
+  // Connect to IPC socket (auto-launch daemon if not running in interactive mode)
+  if (not ConnectToDaemon) and (not GOnceOnly) and (GTestTimeoutSec = 0) and (GSocketPath = OMM_DEFAULT_SOCKET_PATH) then
+  begin
+    if FileExists(ExtractFilePath(ParamStr(0)) + 'omm_daemon' + {$IFDEF WINDOWS}'.exe'{$ELSE}''{$ENDIF}) then
+      SpawnDaemonBackground(ExtractFilePath(ParamStr(0)) + 'omm_daemon' + {$IFDEF WINDOWS}'.exe'{$ELSE}''{$ENDIF})
+    else if FileExists('/usr/bin/omm_daemon') then
+      SpawnDaemonBackground('/usr/bin/omm_daemon');
+    for waitIter := 1 to 15 do
+    begin
+      Sleep(25);
+      if ConnectToDaemon then Break;
+    end;
+    if FPShm = nil then
+      FPShm := OpenSharedMemory(GShmPath, True);
+  end;
 
   // Open library engine
   FLibEngine := TOMMLibraryEngine.Create('', GLibraryFile);
   FLibEngine.OpenLibrary;
+  RebuildFilteredList(FLibEngine);
 
   // Initialize Terminal
   TermInit(GTerm);
@@ -993,7 +1902,16 @@ begin
       Break;
 
     if (FLibEngine <> nil) and ((nowTick - GStartTick) mod 2000 < FRAME_INTERVAL_MS * 2) then
-      FLibEngine.EnsureFresh;
+    begin
+      if FLibEngine.EnsureFresh then
+        RebuildFilteredList(FLibEngine);
+      if FSocketFD < 0 then
+        ConnectToDaemon;
+    end;
+
+    // Poll incoming IPC packets (e.g. online search results)
+    if FSocketFD >= 0 then
+      PollSocketPackets;
 
     // Read SHM snapshot
     FillChar(snap, SizeOf(snap), 0);
@@ -1018,21 +1936,34 @@ begin
     if sleepMs < 1 then sleepMs := 1;
     if (snap.PlaybackState = 1) and (sleepMs > FRAME_INTERVAL_MS) then sleepMs := FRAME_INTERVAL_MS;
 
-    // Non-blocking poll on stdin
+    // Non-blocking poll on stdin and IPC socket
     pollFds[0].fd := STDIN_FILENO;
     pollFds[0].events := POLLIN;
     pollFds[0].revents := 0;
 
-    if fpPoll(@pollFds[0], 1, sleepMs) > 0 then
+    if FSocketFD >= 0 then
     begin
-      if (pollFds[0].revents and POLLIN) <> 0 then
+      pollFds[1].fd := FSocketFD;
+      pollFds[1].events := POLLIN;
+      pollFds[1].revents := 0;
+      if fpPoll(@pollFds[0], 2, sleepMs) > 0 then
       begin
-        HandleInput(snap, FLibEngine);
+        if (pollFds[1].revents and POLLIN) <> 0 then
+          PollSocketPackets;
+        if (pollFds[0].revents and POLLIN) <> 0 then
+          HandleInput(snap, FLibEngine);
+        if (pollFds[0].revents and (POLLHUP or POLLERR)) <> 0 then
+          Break;
       end;
-      if (pollFds[0].revents and (POLLHUP or POLLERR)) <> 0 then
+    end
+    else
+    begin
+      if fpPoll(@pollFds[0], 1, sleepMs) > 0 then
       begin
-        // Stdin pipe closed
-        Break;
+        if (pollFds[0].revents and POLLIN) <> 0 then
+          HandleInput(snap, FLibEngine);
+        if (pollFds[0].revents and (POLLHUP or POLLERR)) <> 0 then
+          Break;
       end;
     end;
 

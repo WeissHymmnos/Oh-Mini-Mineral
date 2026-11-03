@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Types, Forms, Controls, Graphics, Dialogs, ExtCtrls, StdCtrls, LCLType, LCLIntf,
-  Math, BaseUnix, Unix, omm_ipc, omm_shm, omm_library;
+  Math, {$IFDEF UNIX}BaseUnix, Unix,{$ENDIF} ctypes, omm_os, omm_ipc, omm_shm, omm_library;
 
 const
   MAX_CACHE_ITEMS = 128;
@@ -375,10 +375,10 @@ begin
   ConnectIPC;
   if (FSocketFD < 0) and (not FHeadlessTestMode) and (FSocketPath = OMM_DEFAULT_SOCKET_PATH) then
   begin
-    if FileExists(ExtractFilePath(ParamStr(0)) + 'omm_daemon') then
-      fpSystem( ExtractFilePath(ParamStr(0)) + 'omm_daemon >/dev/null 2>&1 &' )
+    if FileExists(ExtractFilePath(ParamStr(0)) + 'omm_daemon' + {$IFDEF WINDOWS}'.exe'{$ELSE}''{$ENDIF}) then
+      SpawnDaemonBackground(ExtractFilePath(ParamStr(0)) + 'omm_daemon' + {$IFDEF WINDOWS}'.exe'{$ELSE}''{$ENDIF})
     else if FileExists('/usr/bin/omm_daemon') then
-      fpSystem('/usr/bin/omm_daemon >/dev/null 2>&1 &');
+      SpawnDaemonBackground('/usr/bin/omm_daemon');
     for i := 1 to 15 do
     begin
       Sleep(25);
@@ -1159,13 +1159,18 @@ end;
 
 function TMainForm.GetMineralConfigDir: string;
 var
-  xdg: string;
+  xdg, homeDir: string;
 begin
   xdg := GetEnvironmentVariable('XDG_DATA_HOME');
   if xdg <> '' then
     Result := xdg + '/mineral'
   else
-    Result := GetEnvironmentVariable('HOME') + '/.local/share/mineral';
+  begin
+    homeDir := GetEnvironmentVariable('HOME');
+    if homeDir = '' then homeDir := GetEnvironmentVariable('USERPROFILE');
+    if homeDir = '' then homeDir := '.';
+    Result := homeDir + '/.local/share/mineral';
+  end;
   if not DirectoryExists(Result) then
     ForceDirectories(Result);
 end;
@@ -1293,7 +1298,9 @@ procedure TMainForm.StopMineralQRLogin;
 begin
   if FQrActive then
   begin
+    {$IFDEF UNIX}
     fpSystem('pkill -f "mineral channel .* login" >/dev/null 2>&1');
+    {$ENDIF}
     FQrActive := False;
   end;
 end;
@@ -1305,11 +1312,16 @@ var
   fd: cint;
   nRead: TsSize;
   i, x, y: Integer;
-  ln, qrsig: string;
+  ln, qrsig, qrLoginPath, qqPollPath, qqPngPath, qqRawPath, qqCookiesPath: string;
 begin
   StopMineralQRLogin;
-  DeleteFile('/tmp/omm_qr_login.txt');
-  DeleteFile('/tmp/omm_qq_poll.txt');
+  qrLoginPath := NormalizeOmmPath('/tmp/omm_qr_login.txt');
+  qqPollPath := NormalizeOmmPath('/tmp/omm_qq_poll.txt');
+  qqPngPath := NormalizeOmmPath('/tmp/omm_qq_qr.png');
+  qqRawPath := NormalizeOmmPath('/tmp/omm_qq_qr.raw');
+  qqCookiesPath := NormalizeOmmPath('/tmp/omm_qq_qr.cookies');
+  DeleteFile(qrLoginPath);
+  DeleteFile(qqPollPath);
   FillChar(FQrGrid, SizeOf(FQrGrid), 0);
   FQrGridW := 0;
   FQrGridH := 0;
@@ -1319,23 +1331,23 @@ begin
   begin
     FQrActive := True;
     FQrStatusText := 'Generating NetEase Cloud QR code...';
-    fpSystem('mineral channel netease login >/tmp/omm_qr_login.txt 2>&1 &');
+    fpSystem('mineral channel netease login >"' + qrLoginPath + '" 2>&1 &');
   end
   else if FSettingsTab = 1 then
   begin
     FQrActive := True;
     FQrStatusText := 'Generating Bilibili QR code...';
-    fpSystem('mineral channel bilibili login >/tmp/omm_qr_login.txt 2>&1 &');
+    fpSystem('mineral channel bilibili login >"' + qrLoginPath + '" 2>&1 &');
   end
   else if FSettingsTab = 2 then
   begin
     FQrStatusText := 'Fetching QQ Music QR code...';
     pbMac.Invalidate;
-    DeleteFile('/tmp/omm_qq_qr.png');
-    DeleteFile('/tmp/omm_qq_qr.raw');
-    DeleteFile('/tmp/omm_qq_qr.cookies');
-    fpSystem('curl -sL --max-time 6 -c /tmp/omm_qq_qr.cookies "https://ssl.ptlogin2.qq.com/ptqrshow?appid=716027609&e=2&l=M&s=3&d=72&v=4&t=0.5&daid=383&pt_3rd_aid=100497308" -o /tmp/omm_qq_qr.png >/dev/null 2>&1 && ffmpeg -y -v error -i /tmp/omm_qq_qr.png -vf scale=37:37:flags=neighbor -f rawvideo -pix_fmt gray /tmp/omm_qq_qr.raw >/dev/null 2>&1');
-    fd := fpOpen('/tmp/omm_qq_qr.raw', O_RDONLY, 0);
+    DeleteFile(qqPngPath);
+    DeleteFile(qqRawPath);
+    DeleteFile(qqCookiesPath);
+    fpSystem('curl -sL --max-time 6 -c "' + qqCookiesPath + '" "https://ssl.ptlogin2.qq.com/ptqrshow?appid=716027609&e=2&l=M&s=3&d=72&v=4&t=0.5&daid=383&pt_3rd_aid=100497308" -o "' + qqPngPath + '" && ffmpeg -y -v error -i "' + qqPngPath + '" -vf scale=37:37:flags=neighbor -f rawvideo -pix_fmt gray "' + qqRawPath + '"');
+    fd := fpOpen(PAnsiChar(qqRawPath), O_RDONLY, 0);
     if fd >= 0 then
     begin
       nRead := fpRead(fd, PAnsiChar(@rawBytes[0]), 37 * 37);
@@ -1349,11 +1361,11 @@ begin
             FQrGrid[x, y] := rawBytes[y * 37 + x] < 128;
       end;
     end;
-    if FileExists('/tmp/omm_qq_qr.cookies') then
+    if FileExists(qqCookiesPath) then
     begin
       sl := TStringList.Create;
       try
-        sl.LoadFromFile('/tmp/omm_qq_qr.cookies');
+        sl.LoadFromFile(qqCookiesPath);
         for i := 0 to sl.Count - 1 do
         begin
           ln := Trim(sl[i]);
@@ -1378,7 +1390,7 @@ begin
   end
   else if FSettingsTab = 3 then
   begin
-    fpSystem('xdg-open "https://music.apple.com" >/dev/null 2>&1 &');
+    OpenUrlInBrowser('https://music.apple.com');
     FQrStatusText := 'Opened music.apple.com — Sign in & click [Paste Token...]';
   end;
   pbMac.Invalidate;
@@ -1388,19 +1400,22 @@ procedure TMainForm.PollMineralQRLogin;
 var
   sl: TStringList;
   i, p, col, qrRow, blkCount, maxCol: Integer;
-  ln, lastStatus, cmd, redirectUrl: string;
+  ln, lastStatus, cmd, redirectUrl, qrLoginPath, qqPollPath, qqCookiesPath: string;
   isQrLine, topBit, botBit: Boolean;
 begin
+  qrLoginPath := NormalizeOmmPath('/tmp/omm_qr_login.txt');
+  qqPollPath := NormalizeOmmPath('/tmp/omm_qq_poll.txt');
+  qqCookiesPath := NormalizeOmmPath('/tmp/omm_qq_qr.cookies');
   if FSettingsTab = 2 then
   begin
     if FQqPtQrToken <= 0 then Exit;
-    cmd := Format('curl -sL --max-time 4 -b /tmp/omm_qq_qr.cookies "https://ssl.ptlogin2.qq.com/ptqrlogin?u1=https%%3A%%2F%%2Fgraph.qq.com%%2Foauth2.0%%2Flogin_jump&ptqrtoken=%d&ptredirect=0&h=1&t=1&g=1&from_ui=1&ptlang=2052&action=0-0-1700000000000&js_ver=20102616&js_type=1&login_sig=&pt_uistyle=40&aid=716027609&daid=383&pt_3rd_aid=100497308" -o /tmp/omm_qq_poll.txt >/dev/null 2>&1 &', [FQqPtQrToken]);
+    cmd := Format('curl -sL --max-time 4 -b "%s" "https://ssl.ptlogin2.qq.com/ptqrlogin?u1=https%%3A%%2F%%2Fgraph.qq.com%%2Foauth2.0%%2Flogin_jump&ptqrtoken=%d&ptredirect=0&h=1&t=1&g=1&from_ui=1&ptlang=2052&action=0-0-1700000000000&js_ver=20102616&js_type=1&login_sig=&pt_uistyle=40&aid=716027609&daid=383&pt_3rd_aid=100497308" -o "%s" &', [qqCookiesPath, FQqPtQrToken, qqPollPath]);
     fpSystem(cmd);
-    if not FileExists('/tmp/omm_qq_poll.txt') then Exit;
+    if not FileExists(qqPollPath) then Exit;
     sl := TStringList.Create;
     try
       try
-        sl.LoadFromFile('/tmp/omm_qq_poll.txt');
+        sl.LoadFromFile(qqPollPath);
         ln := Trim(sl.Text);
         if Pos('''66''', ln) > 0 then
           FQrStatusText := 'Waiting for scan (Mobile QQ / QQ Music)...'
@@ -1419,7 +1434,7 @@ begin
             redirectUrl := Copy(ln, p, 1024);
             if Pos('''', redirectUrl) > 0 then
               redirectUrl := Copy(redirectUrl, 1, Pos('''', redirectUrl) - 1);
-            fpSystem(Format('curl -sL --max-time 6 -b /tmp/omm_qq_qr.cookies -c /tmp/omm_qq_final.cookies "%s" >/dev/null 2>&1', [redirectUrl]));
+            fpSystem(Format('curl -sL --max-time 6 -b "%s" "%s"', [qqCookiesPath, redirectUrl]));
           end;
           sl.Text := Format('{'#10'  "qqmusic_key": "QR_AUTH_%d",'#10'  "uin": "QQ_QR_User"'#10'}'#10, [FQqPtQrToken]);
           sl.SaveToFile(GetMineralConfigDir + '/qq.json');
@@ -1436,11 +1451,11 @@ begin
     Exit;
   end;
 
-  if not FileExists('/tmp/omm_qr_login.txt') then Exit;
+  if not FileExists(qrLoginPath) then Exit;
   sl := TStringList.Create;
   try
     try
-      sl.LoadFromFile('/tmp/omm_qr_login.txt');
+      sl.LoadFromFile(qrLoginPath);
     except
       Exit;
     end;

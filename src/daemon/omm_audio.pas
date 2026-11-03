@@ -6,8 +6,10 @@ unit omm_audio;
 interface
 
 uses
-  BaseUnix, Unix, dynlibs, ctypes, SysUtils, Math,
-  omm_shm, omm_ipc, omm_codec_abi, omm_fft;
+  {$IFDEF UNIX}BaseUnix, Unix,{$ENDIF}
+  {$IFDEF WINDOWS}Windows,{$ENDIF}
+  dynlibs, ctypes, SysUtils, Math,
+  omm_os, omm_shm, omm_ipc, omm_codec_abi, omm_fft;
 
 type
   TOmmStreamReadFn = TCodecReadCallback;
@@ -37,8 +39,6 @@ procedure omm_audio_unload_all_idle_codecs;
 function omm_audio_get_loaded_codec_count: UInt32;
 
 implementation
-
-function malloc_trim(pad: SizeUInt): cint; cdecl; external 'c';
 
 const
   OUTPUT_SAMPLE_RATE = 48000;
@@ -223,7 +223,7 @@ begin
     UnloadLibrary(GCodecSlots[SlotIdx].LibHandle);
     FillChar(GCodecSlots[SlotIdx], SizeOf(TCodecPoolSlot), 0);
     GCodecSlots[SlotIdx].LibHandle := NilHandle;
-    malloc_trim(0);
+    omm_malloc_trim;
   end;
 end;
 
@@ -284,6 +284,8 @@ begin
       resolvedPath := exeDir + ExtractFileName(PluginRelPath)
     else if FileExists(exeDir + 'codecs/' + ExtractFileName(PluginRelPath)) then
       resolvedPath := exeDir + 'codecs/' + ExtractFileName(PluginRelPath)
+    else if FileExists(exeDir + '../Resources/codecs/' + ExtractFileName(PluginRelPath)) then
+      resolvedPath := exeDir + '../Resources/codecs/' + ExtractFileName(PluginRelPath)
     else if FileExists(exeDir + '../' + PluginRelPath) then
       resolvedPath := exeDir + '../' + PluginRelPath
     else if FileExists('/usr/lib64/oh-mini-mineral/codecs/' + ExtractFileName(PluginRelPath)) then
@@ -795,17 +797,230 @@ begin
 end;
 
 // ==============================================================================
-// Hardware Audio Pump Thread (PulseAudio / ALSA / Headless Clock)
 // ==============================================================================
+// Hardware Audio Pump Thread (PulseAudio / ALSA / CoreAudio / WinMM / Headless Clock)
+// ==============================================================================
+
+{$IFDEF WINDOWS}
+const
+  WAVE_MAPPER       = UINT(-1);
+  WAVE_FORMAT_PCM   = 1;
+  CALLBACK_NULL     = 0;
+  WHDR_DONE         = $00000001;
+  WHDR_PREPARED     = $00000002;
+  WHDR_INQUEUE      = $00000010;
+  WINMM_RING_COUNT  = 8;
+
+type
+  TWaveFormatEx = packed record
+    wFormatTag: Word;
+    nChannels: Word;
+    nSamplesPerSec: DWORD;
+    nAvgBytesPerSec: DWORD;
+    nBlockAlign: Word;
+    wBitsPerSample: Word;
+    cbSize: Word;
+  end;
+  PWaveFormatEx = ^TWaveFormatEx;
+
+  TWaveHdr = packed record
+    lpData: PAnsiChar;
+    dwBufferLength: DWORD;
+    dwBytesRecorded: DWORD;
+    dwUser: PtrUInt;
+    dwFlags: DWORD;
+    dwLoops: DWORD;
+    lpNext: Pointer;
+    reserved: PtrUInt;
+  end;
+  PWaveHdr = ^TWaveHdr;
+
+function waveOutOpen(lphWaveOut: PHandle; uDeviceID: UINT; lpFormat: PWaveFormatEx;
+  dwCallback, dwInstance: PtrUInt; dwFlags: DWORD): DWORD; stdcall; external 'winmm.dll' name 'waveOutOpen';
+function waveOutPrepareHeader(hWaveOut: THandle; lpWaveOutHdr: PWaveHdr; uSize: UINT): DWORD; stdcall; external 'winmm.dll' name 'waveOutPrepareHeader';
+function waveOutUnprepareHeader(hWaveOut: THandle; lpWaveOutHdr: PWaveHdr; uSize: UINT): DWORD; stdcall; external 'winmm.dll' name 'waveOutUnprepareHeader';
+function waveOutWrite(hWaveOut: THandle; lpWaveOutHdr: PWaveHdr; uSize: UINT): DWORD; stdcall; external 'winmm.dll' name 'waveOutWrite';
+function waveOutReset(hWaveOut: THandle): DWORD; stdcall; external 'winmm.dll' name 'waveOutReset';
+function waveOutClose(hWaveOut: THandle): DWORD; stdcall; external 'winmm.dll' name 'waveOutClose';
+
+var
+  GWaveOut: THandle = 0;
+  GWaveHdrs: array[0..WINMM_RING_COUNT - 1] of TWaveHdr;
+  GWaveBufs: array[0..WINMM_RING_COUNT - 1, 0..PERIOD_FRAMES * OUTPUT_CHANNELS - 1] of SmallInt;
+  GWaveIdx: Integer = 0;
+{$ENDIF}
+
+{$IFDEF DARWIN}
+const
+  DARWIN_AQ_BUFFERS = 6;
+  DARWIN_RING_FRAMES = PERIOD_FRAMES * 16;
+
+type
+  TAudioStreamBasicDescription = packed record
+    mSampleRate: cdouble;
+    mFormatID: cuint32;
+    mFormatFlags: cuint32;
+    mBytesPerPacket: cuint32;
+    mFramesPerPacket: cuint32;
+    mBytesPerFrame: cuint32;
+    mChannelsPerFrame: cuint32;
+    mBitsPerChannel: cuint32;
+    mReserved: cuint32;
+  end;
+  PAudioStreamBasicDescription = ^TAudioStreamBasicDescription;
+
+  TAudioQueueBuffer = packed record
+    mAudioDataBytesCapacity: cuint32;
+    mAudioData: Pointer;
+    mAudioDataByteSize: cuint32;
+    mUserData: Pointer;
+    mPacketDescriptionCapacity: cuint32;
+    mPacketDescriptions: Pointer;
+    mPacketDescriptionCount: cuint32;
+  end;
+  PAudioQueueBuffer = ^TAudioQueueBuffer;
+
+  TAudioQueueOutputCallback = procedure(inUserData: Pointer; inAQ: Pointer; inBuffer: PAudioQueueBuffer); cdecl;
+  TAudioQueueNewOutputFn = function(const inFormat: PAudioStreamBasicDescription; inCallbackProc: TAudioQueueOutputCallback;
+    inUserData, inCallbackRunLoop, inCallbackRunLoopMode: Pointer; inFlags: cuint32; out outAQ: Pointer): cint32; cdecl;
+  TAudioQueueAllocateBufferFn = function(inAQ: Pointer; inBufferByteSize: cuint32; out outBuffer: PAudioQueueBuffer): cint32; cdecl;
+  TAudioQueueEnqueueBufferFn = function(inAQ: Pointer; inBuffer: PAudioQueueBuffer; inNumPacketDescs: cuint32; inPacketDescs: Pointer): cint32; cdecl;
+  TAudioQueueStartFn = function(inAQ: Pointer; inDeviceStartTime: Pointer): cint32; cdecl;
+  TAudioQueueResetFn = function(inAQ: Pointer): cint32; cdecl;
+  TAudioQueueDisposeFn = function(inAQ: Pointer; inImmediate: Byte): cint32; cdecl;
+
+var
+  GAudioToolboxLib: TLibHandle = NilHandle;
+  GAudioQueue: Pointer = nil;
+  GAQNewOutput: TAudioQueueNewOutputFn = nil;
+  GAQAllocateBuffer: TAudioQueueAllocateBufferFn = nil;
+  GAQEnqueueBuffer: TAudioQueueEnqueueBufferFn = nil;
+  GAQStart: TAudioQueueStartFn = nil;
+  GAQReset: TAudioQueueResetFn = nil;
+  GAQDispose: TAudioQueueDisposeFn = nil;
+  GAQBuffers: array[0..DARWIN_AQ_BUFFERS - 1] of PAudioQueueBuffer;
+  GAQRing: array[0..DARWIN_RING_FRAMES * OUTPUT_CHANNELS - 1] of Single;
+  GAQReadFrame: UInt32 = 0;
+  GAQWriteFrame: UInt32 = 0;
+
+procedure DarwinAudioQueueCallback(inUserData: Pointer; inAQ: Pointer; inBuffer: PAudioQueueBuffer); cdecl;
+var
+  outPtr: PSingle;
+  f, avail, rIdx: UInt32;
+begin
+  if (inBuffer = nil) or (inBuffer^.mAudioData = nil) then Exit;
+  outPtr := PSingle(inBuffer^.mAudioData);
+  avail := GAQWriteFrame - GAQReadFrame;
+  for f := 0 to PERIOD_FRAMES - 1 do
+  begin
+    if avail > 0 then
+    begin
+      rIdx := (GAQReadFrame mod DARWIN_RING_FRAMES) * OUTPUT_CHANNELS;
+      outPtr[f * 2]     := GAQRing[rIdx];
+      outPtr[f * 2 + 1] := GAQRing[rIdx + 1];
+      Inc(GAQReadFrame);
+      Dec(avail);
+    end
+    else
+    begin
+      outPtr[f * 2]     := 0.0;
+      outPtr[f * 2 + 1] := 0.0;
+    end;
+  end;
+  inBuffer^.mAudioDataByteSize := PERIOD_FRAMES * OUTPUT_CHANNELS * SizeOf(Single);
+  if Assigned(GAQEnqueueBuffer) then
+    GAQEnqueueBuffer(inAQ, inBuffer, 0, nil);
+end;
+{$ENDIF}
 
 procedure InitSoundcardOutput;
 var
   ss: TPaSampleSpec;
   attr: TPaBufferAttr;
   paErr: cint;
+  {$IFDEF WINDOWS}
+  wfx: TWaveFormatEx;
+  k: Integer;
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  asbd: TAudioStreamBasicDescription;
+  b: Integer;
+  {$ENDIF}
 begin
-  // 1. Try PulseAudio / PipeWire-Pulse Simple API first
+  {$IFDEF WINDOWS}
+  FillChar(wfx, SizeOf(wfx), 0);
+  wfx.wFormatTag := WAVE_FORMAT_PCM;
+  wfx.nChannels := OUTPUT_CHANNELS;
+  wfx.nSamplesPerSec := OUTPUT_SAMPLE_RATE;
+  wfx.wBitsPerSample := 16;
+  wfx.nBlockAlign := (wfx.nChannels * wfx.wBitsPerSample) div 8;
+  wfx.nAvgBytesPerSec := wfx.nSamplesPerSec * wfx.nBlockAlign;
+  if waveOutOpen(@GWaveOut, WAVE_MAPPER, @wfx, 0, 0, CALLBACK_NULL) = 0 then
+  begin
+    GWaveIdx := 0;
+    for k := 0 to WINMM_RING_COUNT - 1 do
+    begin
+      FillChar(GWaveHdrs[k], SizeOf(TWaveHdr), 0);
+      FillChar(GWaveBufs[k], SizeOf(GWaveBufs[k]), 0);
+      GWaveHdrs[k].lpData := PAnsiChar(@GWaveBufs[k][0]);
+      GWaveHdrs[k].dwBufferLength := PERIOD_FRAMES * OUTPUT_CHANNELS * SizeOf(SmallInt);
+      waveOutPrepareHeader(GWaveOut, @GWaveHdrs[k], SizeOf(TWaveHdr));
+    end;
+    Exit;
+  end
+  else
+    GWaveOut := 0;
+  {$ENDIF}
+
+  {$IFDEF DARWIN}
+  GAudioToolboxLib := LoadLibrary('/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox');
+  if GAudioToolboxLib <> NilHandle then
+  begin
+    Pointer(GAQNewOutput)      := GetProcedureAddress(GAudioToolboxLib, 'AudioQueueNewOutput');
+    Pointer(GAQAllocateBuffer) := GetProcedureAddress(GAudioToolboxLib, 'AudioQueueAllocateBuffer');
+    Pointer(GAQEnqueueBuffer)  := GetProcedureAddress(GAudioToolboxLib, 'AudioQueueEnqueueBuffer');
+    Pointer(GAQStart)          := GetProcedureAddress(GAudioToolboxLib, 'AudioQueueStart');
+    Pointer(GAQReset)          := GetProcedureAddress(GAudioToolboxLib, 'AudioQueueReset');
+    Pointer(GAQDispose)        := GetProcedureAddress(GAudioToolboxLib, 'AudioQueueDispose');
+    if Assigned(GAQNewOutput) and Assigned(GAQAllocateBuffer) and Assigned(GAQEnqueueBuffer) and Assigned(GAQStart) then
+    begin
+      FillChar(asbd, SizeOf(asbd), 0);
+      asbd.mSampleRate       := OUTPUT_SAMPLE_RATE;
+      asbd.mFormatID         := $6C70636D; // 'lpcm'
+      asbd.mFormatFlags      := 9;         // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+      asbd.mBytesPerPacket   := OUTPUT_CHANNELS * SizeOf(Single);
+      asbd.mFramesPerPacket  := 1;
+      asbd.mBytesPerFrame    := OUTPUT_CHANNELS * SizeOf(Single);
+      asbd.mChannelsPerFrame := OUTPUT_CHANNELS;
+      asbd.mBitsPerChannel   := 32;
+      GAQReadFrame := 0;
+      GAQWriteFrame := 0;
+      if (GAQNewOutput(@asbd, @DarwinAudioQueueCallback, nil, nil, nil, 0, GAudioQueue) = 0) and (GAudioQueue <> nil) then
+      begin
+        for b := 0 to DARWIN_AQ_BUFFERS - 1 do
+        begin
+          GAQBuffers[b] := nil;
+          if (GAQAllocateBuffer(GAudioQueue, PERIOD_FRAMES * OUTPUT_CHANNELS * SizeOf(Single), GAQBuffers[b]) = 0) and (GAQBuffers[b] <> nil) then
+          begin
+            FillChar(GAQBuffers[b]^.mAudioData^, PERIOD_FRAMES * OUTPUT_CHANNELS * SizeOf(Single), 0);
+            GAQBuffers[b]^.mAudioDataByteSize := PERIOD_FRAMES * OUTPUT_CHANNELS * SizeOf(Single);
+            GAQEnqueueBuffer(GAudioQueue, GAQBuffers[b], 0, nil);
+          end;
+        end;
+        GAQStart(GAudioQueue, nil);
+        Exit;
+      end;
+    end;
+  end;
+  {$ENDIF}
+
+  // 1. Try PulseAudio / PipeWire-Pulse Simple API
+  {$IFDEF DARWIN}
+  GPaLib := LoadLibrary('libpulse-simple.0.dylib');
+  if GPaLib = NilHandle then GPaLib := LoadLibrary('/opt/homebrew/lib/libpulse-simple.dylib');
+  {$ELSE}
   GPaLib := LoadLibrary('libpulse-simple.so.0');
+  {$ENDIF}
   if GPaLib <> NilHandle then
   begin
     Pointer(GPaNew)   := GetProcedureAddress(GPaLib, 'pa_simple_new');
@@ -833,6 +1048,7 @@ begin
   end;
 
   // 2. Fallback to ALSA (libasound.so.2)
+  {$IFDEF LINUX}
   GAlsaLib := LoadLibrary('libasound.so.2');
   if GAlsaLib <> NilHandle then
   begin
@@ -854,10 +1070,39 @@ begin
       end;
     end;
   end;
+  {$ENDIF}
 end;
 
 procedure CloseSoundcardOutput;
+{$IFDEF WINDOWS}
+var
+  k: Integer;
+{$ENDIF}
 begin
+  {$IFDEF WINDOWS}
+  if GWaveOut <> 0 then
+  begin
+    waveOutReset(GWaveOut);
+    for k := 0 to WINMM_RING_COUNT - 1 do
+      waveOutUnprepareHeader(GWaveOut, @GWaveHdrs[k], SizeOf(TWaveHdr));
+    waveOutClose(GWaveOut);
+    GWaveOut := 0;
+  end;
+  {$ENDIF}
+
+  {$IFDEF DARWIN}
+  if (GAudioQueue <> nil) and Assigned(GAQDispose) then
+  begin
+    GAQDispose(GAudioQueue, 1);
+    GAudioQueue := nil;
+  end;
+  if GAudioToolboxLib <> NilHandle then
+  begin
+    UnloadLibrary(GAudioToolboxLib);
+    GAudioToolboxLib := NilHandle;
+  end;
+  {$ENDIF}
+
   if (GPaSimple <> nil) and Assigned(GPaFree) then
   begin
     GPaFree(GPaSimple);
@@ -977,6 +1222,13 @@ begin
     if GFlushHardware then
     begin
       GFlushHardware := False;
+      {$IFDEF WINDOWS}
+      if GWaveOut <> 0 then
+        waveOutReset(GWaveOut);
+      {$ENDIF}
+      {$IFDEF DARWIN}
+      GAQReadFrame := GAQWriteFrame;
+      {$ENDIF}
       if (GPaSimple <> nil) and Assigned(GPaFlush) then
       begin
         paErr := 0;
@@ -987,6 +1239,40 @@ begin
     end;
     if isPlaying and (not usedSynthetic) then
     begin
+      {$IFDEF WINDOWS}
+      if GWaveOut <> 0 then
+      begin
+        for i := 0 to PERIOD_FRAMES * OUTPUT_CHANNELS - 1 do
+          GWaveBufs[GWaveIdx][i] := SmallInt(Round(EnsureRange(mixBuf[i], -1.0, 1.0) * 32767.0));
+        remFrames := 0;
+        while ((GWaveHdrs[GWaveIdx].dwFlags and WHDR_INQUEUE) <> 0) and (remFrames < 50) do
+        begin
+          Windows.Sleep(1);
+          Inc(remFrames);
+        end;
+        if (GWaveHdrs[GWaveIdx].dwFlags and WHDR_INQUEUE) = 0 then
+        begin
+          if waveOutWrite(GWaveOut, @GWaveHdrs[GWaveIdx], SizeOf(TWaveHdr)) = 0 then
+          begin
+            GWaveIdx := (GWaveIdx + 1) mod WINMM_RING_COUNT;
+            wroteHardware := True;
+          end;
+        end;
+      end;
+      {$ENDIF}
+      {$IFDEF DARWIN}
+      if GAudioQueue <> nil then
+      begin
+        for i := 0 to PERIOD_FRAMES - 1 do
+        begin
+          remFrames := (GAQWriteFrame mod DARWIN_RING_FRAMES) * OUTPUT_CHANNELS;
+          GAQRing[remFrames]     := mixBuf[i * 2];
+          GAQRing[remFrames + 1] := mixBuf[i * 2 + 1];
+          Inc(GAQWriteFrame);
+        end;
+        // Let the 60 FPS sleep below pace the producer thread cleanly
+      end;
+      {$ENDIF}
       if (GPaSimple <> nil) and Assigned(GPaWrite) then
       begin
         paErr := 0;

@@ -6,7 +6,13 @@ unit omm_shm;
 interface
 
 uses
-  BaseUnix, Unix, ctypes;
+  {$IFDEF UNIX}
+  BaseUnix, Unix,
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  Windows,
+  {$ENDIF}
+  ctypes, omm_os;
 
 const
   OMM_SHM_NAME       = '/omm_shm';
@@ -38,9 +44,11 @@ const
   OMM_PLUGIN_SUSPENDED   = 3;
   OMM_PLUGIN_DEEP_UNLOAD = 4;
 
+{$IFDEF UNIX}
 // POSIX Shared Memory Libc Bindings
 function shm_open(name: PChar; oflag: cint; mode: mode_t): cint; cdecl; external 'c';
 function shm_unlink(name: PChar): cint; cdecl; external 'c';
+{$ENDIF}
 
 type
   // Exactly 65,536 bytes (64 KB)
@@ -89,10 +97,13 @@ type
     LyricNext: array[0..255] of AnsiChar;        // 256 bytes (0x0400 - 0x04FF): Next lyric line
     LyricTranslation: array[0..255] of AnsiChar; // 256 bytes (0x0500 - 0x05FF): Translated lyric line
 
-    // 0x0600 - 0x06FF: Lyric Timing & Reserved
+    // 0x0600 - 0x06FF: Lyric Timing & Metadata
     LyricTimestampMs: UInt32;           // 4 bytes: Timestamp of LyricCurrent in ms
     LyricLineIdx: UInt32;               // 4 bytes: Index of active lyric line
-    ReservedLyric: array[0..247] of Byte; // 248 bytes: Alignment pad to 0x0700
+    LrcGeneration: UInt32;              // 4 bytes: Increments whenever full LRC payload changes
+    LrcLineCount: UInt32;               // 4 bytes: Total parsed LRC lines
+    LrcTextLen: UInt32;                 // 4 bytes: Byte length of LrcRawText
+    ReservedLyric: array[0..235] of Byte; // 236 bytes: Alignment pad to 0x0700
 
     // 0x0700 - 0x07FF: Spectrum Configuration & Frame Counter
     SpectrumBands: UInt32;              // 4 bytes: FFT spectrum band count (constant 64)
@@ -109,8 +120,11 @@ type
     // 0x0B00 - 0x12FF: Oscilloscope Waveform Tap
     OscilloscopeTap: array[0..511] of Single; // 2048 bytes: Circular PCM waveform sample buffer
 
-    // 0x1300 - 0xFFFF: Reserved Segment Padding
-    ReservedPayload: array[0..60671] of Byte; // 60672 bytes: Pad to exactly 65,536 bytes (64 KB)
+    // 0x1300 - 0x52FF: Full Raw LRC Buffer for GUI Multi-Line Auto-Scrolling
+    LrcRawText: array[0..16383] of AnsiChar; // 16384 bytes: Null-terminated UTF-8 LRC document
+
+    // 0x5300 - 0xFFFF: Reserved Segment Padding
+    ReservedPayload: array[0..44287] of Byte; // 44288 bytes: Pad to exactly 65,536 bytes (64 KB)
   end;
   POMMSharedMemory = ^TOMMSharedMemory;
 
@@ -184,17 +198,21 @@ begin
   // Increment sequence counter to make it ODD (write in progress)
   InterlockedIncrement64(Int64(Seq));
   WriteBarrier;
+  {$IFDEF CPUX86_64}
   asm
     sfence
   end;
+  {$ENDIF}
 end;
 
 procedure SeqLockWriteEnd(var Seq: UInt64);
 begin
   WriteBarrier;
+  {$IFDEF CPUX86_64}
   asm
     sfence
   end;
+  {$ENDIF}
   // Increment sequence counter to make it EVEN (write completed, stable state)
   InterlockedIncrement64(Int64(Seq));
 end;
@@ -209,15 +227,21 @@ begin
     CurrentSeq := pSeq^;
     while (CurrentSeq and 1) <> 0 do
     begin
+      {$IFDEF CPUX86_64}
       asm
         pause
       end;
+      {$ELSE}
+      ReadBarrier;
+      {$ENDIF}
       CurrentSeq := pSeq^;
     end;
     ReadBarrier;
+    {$IFDEF CPUX86_64}
     asm
       lfence
     end;
+    {$ENDIF}
     CurrentSeq := pSeq^;
   until (CurrentSeq and 1) = 0;
   Result := CurrentSeq;
@@ -229,25 +253,60 @@ var
 begin
   pSeq := @Seq;
   ReadBarrier;
+  {$IFDEF CPUX86_64}
   asm
     lfence
   end;
+  {$ENDIF}
   Result := (pSeq^ <> StartSeq);
 end;
 
+function GetFallbackShmFilePath(const ShmName: string): string;
+var
+  clean: string;
+  i: Integer;
+begin
+  clean := ShmName;
+  while (Length(clean) > 0) and ((clean[1] = '/') or (clean[1] = '\')) do
+    Delete(clean, 1, 1);
+  for i := 1 to Length(clean) do
+    if (clean[i] = '/') or (clean[i] = '\') or (clean[i] = ':') then
+      clean[i] := '_';
+  if clean = '' then clean := 'omm_shm';
+  Result := NormalizeOmmPath('/tmp/' + clean + '.shm');
+end;
+
 function CreateSharedMemory(const ShmName: string): POMMSharedMemory;
+{$IFDEF UNIX}
 var
   fd: cint;
   pShm: POMMSharedMemory;
+  fbPath: string;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  fbPath: string;
+  hFile, hMap: THandle;
+  pShm: POMMSharedMemory;
+{$ENDIF}
 begin
   Result := nil;
+  {$IFDEF UNIX}
+  {$IFDEF DARWIN}
+  shm_unlink(PChar(ShmName));
+  {$ENDIF}
   fd := shm_open(PChar(ShmName), O_RDWR or O_CREAT, &666);
-  if fd < 0 then Exit;
-
-  if fpfTruncate(fd, OMM_SHM_SIZE) <> 0 then
+  if (fd < 0) or (fpfTruncate(fd, OMM_SHM_SIZE) <> 0) then
   begin
-    fpClose(fd);
-    Exit;
+    if fd >= 0 then fpClose(fd);
+    fbPath := GetFallbackShmFilePath(ShmName);
+    fd := fpOpen(PChar(fbPath), O_RDWR or O_CREAT or O_TRUNC, &666);
+    if fd < 0 then Exit;
+    if fpfTruncate(fd, OMM_SHM_SIZE) <> 0 then
+    begin
+      fpClose(fd);
+      Exit;
+    end;
   end;
 
   pShm := POMMSharedMemory(fpMMap(nil, OMM_SHM_SIZE, PROT_READ or PROT_WRITE, MAP_SHARED, fd, 0));
@@ -255,24 +314,52 @@ begin
 
   if (pShm = nil) or (pShm = POMMSharedMemory(Pointer(-1))) then
     Exit;
+  {$ENDIF}
+
+  {$IFDEF WINDOWS}
+  fbPath := GetFallbackShmFilePath(ShmName);
+  hFile := CreateFileA(PAnsiChar(fbPath), GENERIC_READ or GENERIC_WRITE,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+    nil, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  if hFile = INVALID_HANDLE_VALUE then Exit;
+  SetFilePointer(hFile, OMM_SHM_SIZE, nil, FILE_BEGIN);
+  SetEndOfFile(hFile);
+  hMap := CreateFileMappingA(hFile, nil, PAGE_READWRITE, 0, OMM_SHM_SIZE, nil);
+  CloseHandle(hFile);
+  if hMap = 0 then Exit;
+  pShm := POMMSharedMemory(MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, OMM_SHM_SIZE));
+  CloseHandle(hMap);
+  if pShm = nil then Exit;
+  {$ENDIF}
 
   FillChar(pShm^, OMM_SHM_SIZE, 0);
   pShm^.Magic := OMM_SHM_MAGIC;
   pShm^.Version := OMM_SHM_VERSION;
   pShm^.SpectrumBands := OMM_SPECTRUM_BANDS;
-  pShm^.DaemonPID := fpGetPID;
+  pShm^.DaemonPID := FpGetpid;
 
   Result := pShm;
 end;
 
 function OpenSharedMemory(const ShmName: string; ReadOnly: Boolean): POMMSharedMemory;
+{$IFDEF UNIX}
 var
   fd: cint;
   oflag: cint;
   prot: cint;
   pShm: POMMSharedMemory;
+  fbPath: string;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  fbPath: string;
+  hFile, hMap: THandle;
+  accessMode, protectMode, mapAccess: DWORD;
+  pShm: POMMSharedMemory;
+{$ENDIF}
 begin
   Result := nil;
+  {$IFDEF UNIX}
   if ReadOnly then
   begin
     oflag := O_RDONLY;
@@ -288,7 +375,12 @@ begin
   if fd < 0 then
   begin
     fd := fpOpen(PChar(ShmName), oflag, 0);
-    if fd < 0 then Exit;
+    if fd < 0 then
+    begin
+      fbPath := GetFallbackShmFilePath(ShmName);
+      fd := fpOpen(PChar(fbPath), oflag, 0);
+      if fd < 0 then Exit;
+    end;
   end;
 
   pShm := POMMSharedMemory(fpMMap(nil, OMM_SHM_SIZE, prot, MAP_SHARED, fd, 0));
@@ -304,19 +396,71 @@ begin
   end;
 
   Result := pShm;
+  {$ENDIF}
+
+  {$IFDEF WINDOWS}
+  fbPath := GetFallbackShmFilePath(ShmName);
+  if ReadOnly then
+  begin
+    accessMode := GENERIC_READ;
+    protectMode := PAGE_READONLY;
+    mapAccess := FILE_MAP_READ;
+  end
+  else
+  begin
+    accessMode := GENERIC_READ or GENERIC_WRITE;
+    protectMode := PAGE_READWRITE;
+    mapAccess := FILE_MAP_ALL_ACCESS;
+  end;
+  hFile := CreateFileA(PAnsiChar(fbPath), accessMode,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+    nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if hFile = INVALID_HANDLE_VALUE then
+  begin
+    hFile := CreateFileA(PAnsiChar(NormalizeOmmPath(ShmName)), accessMode,
+      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+      nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if hFile = INVALID_HANDLE_VALUE then Exit;
+  end;
+  hMap := CreateFileMappingA(hFile, nil, protectMode, 0, OMM_SHM_SIZE, nil);
+  CloseHandle(hFile);
+  if hMap = 0 then Exit;
+  pShm := POMMSharedMemory(MapViewOfFile(hMap, mapAccess, 0, 0, OMM_SHM_SIZE));
+  CloseHandle(hMap);
+  if pShm = nil then Exit;
+  if (pShm^.Magic <> OMM_SHM_MAGIC) or (pShm^.Version <> OMM_SHM_VERSION) then
+  begin
+    UnmapViewOfFile(pShm);
+    Exit(nil);
+  end;
+  Result := pShm;
+  {$ENDIF}
 end;
 
 function CloseSharedMemory(pShm: POMMSharedMemory): Boolean;
 begin
   if (pShm <> nil) and (pShm <> POMMSharedMemory(Pointer(-1))) then
-    Result := (fpMUnmap(pShm, OMM_SHM_SIZE) = 0)
+  begin
+    {$IFDEF UNIX}
+    Result := (fpMUnmap(pShm, OMM_SHM_SIZE) = 0);
+    {$ENDIF}
+    {$IFDEF WINDOWS}
+    Result := UnmapViewOfFile(pShm);
+    {$ENDIF}
+  end
   else
     Result := False;
 end;
 
 function UnlinkSharedMemory(const ShmName: string): Boolean;
 begin
+  {$IFDEF UNIX}
   Result := (shm_unlink(PChar(ShmName)) = 0);
+  fpUnlink(PChar(GetFallbackShmFilePath(ShmName)));
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  Result := (fpUnlink(PChar(GetFallbackShmFilePath(ShmName))) = 0);
+  {$ENDIF}
 end;
 
 end.

@@ -707,7 +707,19 @@ fn is_complete_cached_audio_file(path: &Path) -> bool {
     !still_writing
 }
 
+fn get_mineral_cache_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join("omm_mineral_cache")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/tmp/omm_mineral_cache")
+    }
+}
+
 fn stop_previous_background_downloads() {
+    #[cfg(not(windows))]
     let _ = Command::new("pkill")
         .args(["-f", "/tmp/omm_mineral_cache/"])
         .stdin(Stdio::null())
@@ -731,7 +743,8 @@ fn wait_for_progressive_buffer(path: &Path, min_bytes: u64, max_wait_ms: u64) ->
 /// Returns as soon as the initial 32 KB audio frame buffer is ready (~100-250ms), while background
 /// `curl` / `ffmpeg` continues streaming the rest of long audio tracks seamlessly!
 pub fn resolve_online_audio_file(uri: &str) -> Option<PathBuf> {
-    let cache_dir = Path::new("/tmp/omm_mineral_cache");
+    let cache_dir_buf = get_mineral_cache_dir();
+    let cache_dir = cache_dir_buf.as_path();
     let _ = fs::create_dir_all(cache_dir);
 
     if let Some(mid) = uri.strip_prefix("qq://") {

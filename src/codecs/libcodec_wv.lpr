@@ -4,9 +4,7 @@ library libcodec_wv;
 {$PACKRECORDS C}
 
 uses
-  BaseUnix, ctypes, omm_codec_abi;
-
-function c_system(cmd: PAnsiChar): cint; cdecl; external 'c' name 'system';
+  {$IFDEF UNIX}BaseUnix,{$ENDIF} ctypes, omm_codec_abi, omm_os;
 
 const
   WV_SR_TABLE: array[0..15] of UInt32 = (

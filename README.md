@@ -5,6 +5,7 @@
 **[Mineral](https://github.com/10knamesmore/Mineral) 的超轻量级复古 Macintosh System 7 桌面与微内核客户端（与 Qt 版 [Oh-My-Mineral](https://github.com/WeissHymmnos/Oh-My-Mineral) 并行开发）**
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
+[![Build & Release Packages](https://github.com/WeissHymmnos/Oh-Mini-Mineral/actions/workflows/release.yml/badge.svg)](https://github.com/WeissHymmnos/Oh-Mini-Mineral/actions/workflows/release.yml)
 [![Releases](https://img.shields.io/github/v/release/WeissHymmnos/Oh-Mini-Mineral)](https://github.com/WeissHymmnos/Oh-Mini-Mineral/releases)
 
 <img src="./assets/mini-screenshot-main.png" alt="Oh-Mini-Mineral Classic Macintosh System 7 主工作台与 64 段 CRT 频谱" width="820"/>
@@ -25,22 +26,30 @@
 - **内置四平台扫码与 Cookie 登录配置** — 点击歌曲详情右下角扁平按钮 `⚙ Mineral Login & Settings` 即可直接在复古弹窗内扫码登录**网易云音乐**、**Bilibili**、**QQ 音乐**，或配置 **Apple Music** Token / 曲库地区（与原版 `~/.local/share/mineral/` 完全互通）。
 - **无状态 60 FPS 终端客户端 (`omm_tui`)** — 通过 POSIX 共享内存 Seqlock (`omm_shm`) 与 Unix Domain Socket (`omm_ipc`) 零堆分配直连守护进程。
 
-## 下载与安装
+## 下载与安装 (Linux / macOS / Windows)
 
 前往 **[GitHub Releases](https://github.com/WeissHymmnos/Oh-Mini-Mineral/releases)** 下载对应平台的安装包（与 Qt 版 `oh-my-mineral` 完全独立，可并存安装）：
 
 - **Linux (RPM)**：`sudo rpm -Uvh oh-mini-mineral-0.1.0-1.x86_64.rpm`
 - **Linux (DEB)**：`sudo apt install ./oh-mini-mineral_0.1.0-1_amd64.deb`
 - **Linux (Portable Tarball)**：解压 `oh-mini-mineral-0.1.0-linux-x86_64.tar.gz`，运行 `./run.sh`
+- **macOS (DMG)**：挂载 `Oh-Mini-Mineral-0.1.0-macOS.dmg`，将 `Oh-Mini-Mineral.app` 拖入 `Applications`（内置 Cocoa 原生 LCL 界面、CoreAudio `AudioToolbox` 硬件输出与 `.dylib` 解码器池）
+- **Windows (x64 ZIP)**：解压 `Oh-Mini-Mineral-0.1.0-win64.zip`，双击运行 `Oh-Mini-Mineral.exe` 或 `omm_gui.exe`（内置 Win32/Win64 原生 LCL 界面、`winmm.dll` 硬件输出与 `.dll` 解码器池）
 
 ## 从源码构建与打包
 
 ```bash
-# 构建全部组件 (libomm_mineral.so + libcodec_*.so + omm_daemon + omm_tui + omm_gui)
+# 构建全部组件 (libomm_mineral.{so,dylib,dll} + libcodec_*.{so,dylib,dll} + omm_daemon + omm_tui + omm_gui)
 ./scripts/build_all.sh all
 
-# 生成 RPM / DEB / Tarball 发布包至 dist/
+# Linux: 生成 RPM / DEB / Tarball 发布包至 dist/
 python3 ./scripts/package_release.py
+
+# macOS: 生成 Oh-Mini-Mineral-0.1.0-macOS.dmg
+./scripts/package_macos.sh 0.1.0
+
+# Windows (PowerShell): 生成 Oh-Mini-Mineral-0.1.0-win64.zip
+pwsh -File ./scripts/package_windows.ps1 0.1.0
 ```
 
 运行客户端：

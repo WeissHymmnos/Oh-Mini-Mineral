@@ -7,7 +7,13 @@ unit omm_ipc;
 interface
 
 uses
-  BaseUnix, Sockets, ctypes;
+  {$IFDEF UNIX}
+  BaseUnix, Sockets,
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  Windows, Winsock2,
+  {$ENDIF}
+  ctypes, omm_os;
 
 const
   OMM_DEFAULT_SOCKET_PATH = '/tmp/omm.sock';
@@ -172,36 +178,109 @@ begin
   Packet.StatusCode := StatusCode;
 end;
 
-function CreateUnixSocket: cint;
+{$IFDEF DARWIN}
+const
+  MSG_NOSIGNAL = 0;
+  SO_NOSIGPIPE = $1022;
+{$ENDIF}
+
+{$IFDEF WINDOWS}
+function SocketPathToPort(const SocketPath: string): Word;
+var
+  i: Integer;
+  h: UInt32;
 begin
+  if (SocketPath = '') or (SocketPath = OMM_DEFAULT_SOCKET_PATH) then
+    Exit(44951);
+  h := 2166136261;
+  for i := 1 to Length(SocketPath) do
+    h := (h xor UInt32(Ord(SocketPath[i]))) * 16777619;
+  Result := Word(40000 + (h mod 20000));
+end;
+{$ENDIF}
+
+function CreateUnixSocket: cint;
+{$IFDEF DARWIN}
+var
+  optVal: cint;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  rawSock: TSocket;
+  optVal: cint;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
   Result := fpSocket(AF_UNIX, SOCK_STREAM, 0);
+  {$IFDEF DARWIN}
+  if Result >= 0 then
+  begin
+    optVal := 1;
+    fpSetSockOpt(Result, SOL_SOCKET, SO_NOSIGPIPE, @optVal, SizeOf(optVal));
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  rawSock := Winsock2.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if rawSock = INVALID_SOCKET then
+    Result := -1
+  else
+  begin
+    optVal := 1;
+    Winsock2.setsockopt(rawSock, IPPROTO_TCP, TCP_NODELAY, @optVal, SizeOf(optVal));
+    Result := cint(rawSock) or OMM_SOCKET_TAG;
+  end;
+  {$ENDIF}
 end;
 
 function SetSocketNonBlocking(SocketFD: cint): Boolean;
+{$IFDEF UNIX}
 var
   flags: cint;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  mode: u_long;
+{$ENDIF}
 begin
+  if SocketFD < 0 then Exit(False);
+  {$IFDEF UNIX}
   flags := fpFCNTL(SocketFD, F_GETFL, 0);
   if flags < 0 then Exit(False);
   Result := (fpFCNTL(SocketFD, F_SETFL, flags or O_NONBLOCK) = 0);
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  mode := 1;
+  Result := (Winsock2.ioctlsocket(TSocket(SocketFD and (not OMM_SOCKET_TAG)), LongInt(FIONBIO), mode) = 0);
+  {$ENDIF}
 end;
 
 function BindAndListenUnixSocket(SocketFD: cint; const SocketPath: string; Backlog: cint): Boolean;
+{$IFDEF UNIX}
 var
   addr: sockaddr_un;
-  pathLen: Integer;
+  pathLen, maxLen: Integer;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  rawSock: TSocket;
+  addr: TSockAddrIn;
+  optVal: cint;
+{$ENDIF}
 begin
   Result := False;
   if SocketFD < 0 then Exit;
 
+  {$IFDEF UNIX}
   fpUnlink(PChar(SocketPath));
   FillChar(addr, SizeOf(addr), 0);
   addr.sun_family := AF_UNIX;
 
   pathLen := Length(SocketPath);
+  maxLen := SizeOf(addr.sun_path) - 1;
   if pathLen > 0 then
   begin
-    if pathLen > 107 then pathLen := 107;
+    if pathLen > maxLen then pathLen := maxLen;
     Move(SocketPath[1], addr.sun_path[0], pathLen);
   end;
 
@@ -209,37 +288,88 @@ begin
   if fpListen(SocketFD, Backlog) <> 0 then Exit;
 
   Result := True;
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  rawSock := TSocket(SocketFD and (not OMM_SOCKET_TAG));
+  optVal := 1;
+  Winsock2.setsockopt(rawSock, SOL_SOCKET, SO_REUSEADDR, @optVal, SizeOf(optVal));
+  FillChar(addr, SizeOf(addr), 0);
+  addr.sin_family := AF_INET;
+  addr.sin_port := htons(SocketPathToPort(SocketPath));
+  addr.sin_addr.s_addr := htonl(INADDR_LOOPBACK);
+  if Winsock2.bind(rawSock, addr, SizeOf(addr)) <> 0 then Exit;
+  if Winsock2.listen(rawSock, Backlog) <> 0 then Exit;
+  Result := True;
+  {$ENDIF}
 end;
 
 function ConnectUnixSocket(SocketFD: cint; const SocketPath: string): Boolean;
+{$IFDEF UNIX}
 var
   addr: sockaddr_un;
-  pathLen: Integer;
+  pathLen, maxLen: Integer;
+{$ENDIF}
+{$IFDEF WINDOWS}
+var
+  rawSock: TSocket;
+  addr: TSockAddrIn;
+{$ENDIF}
 begin
   Result := False;
   if SocketFD < 0 then Exit;
 
+  {$IFDEF UNIX}
   FillChar(addr, SizeOf(addr), 0);
   addr.sun_family := AF_UNIX;
 
   pathLen := Length(SocketPath);
+  maxLen := SizeOf(addr.sun_path) - 1;
   if pathLen > 0 then
   begin
-    if pathLen > 107 then pathLen := 107;
+    if pathLen > maxLen then pathLen := maxLen;
     Move(SocketPath[1], addr.sun_path[0], pathLen);
   end;
 
   Result := (fpConnect(SocketFD, @addr, SizeOf(addr)) = 0);
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  rawSock := TSocket(SocketFD and (not OMM_SOCKET_TAG));
+  FillChar(addr, SizeOf(addr), 0);
+  addr.sin_family := AF_INET;
+  addr.sin_port := htons(SocketPathToPort(SocketPath));
+  addr.sin_addr.s_addr := htonl(INADDR_LOOPBACK);
+  Result := (Winsock2.connect(rawSock, addr, SizeOf(addr)) = 0);
+  {$ENDIF}
 end;
 
 function AcceptUnixSocket(ServerFD: cint): cint;
+{$IFDEF WINDOWS}
+var
+  rawSock, clientSock: TSocket;
+  optVal: cint;
+{$ENDIF}
 begin
+  {$IFDEF UNIX}
   Result := fpAccept(ServerFD, nil, nil);
+  {$ENDIF}
+  {$IFDEF WINDOWS}
+  if ServerFD < 0 then Exit(-1);
+  rawSock := TSocket(ServerFD and (not OMM_SOCKET_TAG));
+  clientSock := Winsock2.accept(rawSock, nil, nil);
+  if clientSock = INVALID_SOCKET then
+    Result := -1
+  else
+  begin
+    optVal := 1;
+    Winsock2.setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, @optVal, SizeOf(optVal));
+    Result := cint(clientSock) or OMM_SOCKET_TAG;
+  end;
+  {$ENDIF}
 end;
 
 function PollSocket(SocketFD: cint; Events: cshort; TimeoutMs: cint): cint;
 var
-  pfd: TPollFD;
+  pfd: {$IFDEF UNIX}TPollFD{$ELSE}pollfd{$ENDIF};
   res: cint;
 begin
   pfd.fd := SocketFD;
@@ -254,14 +384,18 @@ end;
 
 function SendPacket(SocketFD: cint; const Packet: TOMMPacket): Boolean;
 var
-  total, n: ssize_t;
+  total, n: {$IFDEF UNIX}ssize_t{$ELSE}TsSize{$ENDIF};
   buf: PByte;
 begin
   total := 0;
   buf := PByte(@Packet);
   while total < SizeOf(TOMMPacket) do
   begin
+    {$IFDEF UNIX}
     n := fpSend(SocketFD, @buf[total], SizeOf(TOMMPacket) - total, MSG_NOSIGNAL);
+    {$ELSE}
+    n := fpWrite(SocketFD, @buf[total], SizeOf(TOMMPacket) - total);
+    {$ENDIF}
     if n <= 0 then
     begin
       if (n < 0) and (fpGetErrno = ESysEINTR) then
@@ -275,7 +409,7 @@ end;
 
 function RecvPacket(SocketFD: cint; var Packet: TOMMPacket): Boolean;
 var
-  total, n: ssize_t;
+  total, n: {$IFDEF UNIX}ssize_t{$ELSE}TsSize{$ENDIF};
   buf: PByte;
 begin
   total := 0;

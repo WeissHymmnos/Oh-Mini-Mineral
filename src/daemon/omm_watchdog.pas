@@ -6,13 +6,11 @@ unit omm_watchdog;
 interface
 
 uses
-  dynlibs, SysUtils, ctypes, omm_shm, omm_ipc, omm_audio;
-
-function malloc_trim(pad: SizeUInt): cint; cdecl; external 'c';
+  dynlibs, SysUtils, ctypes, omm_os, omm_shm, omm_ipc, omm_audio;
 
 const
-  PLUGIN_DEFAULT_LIB_PATH    = 'bin/libomm_mineral.so';
-  PLUGIN_FALLBACK_LIB_PATH   = 'target/release/libomm_mineral.so';
+  PLUGIN_DEFAULT_LIB_PATH    = 'bin/libomm_mineral' + OMM_LIB_EXT;
+  PLUGIN_FALLBACK_LIB_PATH   = 'target/release/libomm_mineral' + OMM_LIB_EXT;
   PLUGIN_DEFAULT_CONFIG_PATH = 'daemon.lua';
 
   // Lifecycle inactivity timeout thresholds (seconds)
@@ -120,12 +118,20 @@ begin
   resolvedPath := FLibPath;
   if not FileExists(resolvedPath) then
   begin
-    if FileExists(ExtractFilePath(ParamStr(0)) + 'libomm_mineral.so') then
+    if FileExists(ExtractFilePath(ParamStr(0)) + 'libomm_mineral' + OMM_LIB_EXT) then
+      resolvedPath := ExtractFilePath(ParamStr(0)) + 'libomm_mineral' + OMM_LIB_EXT
+    else if FileExists(ExtractFilePath(ParamStr(0)) + 'omm_mineral' + OMM_LIB_EXT) then
+      resolvedPath := ExtractFilePath(ParamStr(0)) + 'omm_mineral' + OMM_LIB_EXT
+    else if FileExists(ExtractFilePath(ParamStr(0)) + 'libomm_mineral.so') then
       resolvedPath := ExtractFilePath(ParamStr(0)) + 'libomm_mineral.so'
     else if FileExists(PLUGIN_DEFAULT_LIB_PATH) then
       resolvedPath := PLUGIN_DEFAULT_LIB_PATH
+    else if FileExists('bin/omm_mineral' + OMM_LIB_EXT) then
+      resolvedPath := 'bin/omm_mineral' + OMM_LIB_EXT
     else if FileExists(PLUGIN_FALLBACK_LIB_PATH) then
       resolvedPath := PLUGIN_FALLBACK_LIB_PATH
+    else if FileExists('target/release/omm_mineral' + OMM_LIB_EXT) then
+      resolvedPath := 'target/release/omm_mineral' + OMM_LIB_EXT
     else if FileExists('/usr/lib64/oh-mini-mineral/libomm_mineral.so') then
       resolvedPath := '/usr/lib64/oh-mini-mineral/libomm_mineral.so'
     else if FileExists('/usr/lib/oh-mini-mineral/libomm_mineral.so') then
@@ -223,7 +229,7 @@ begin
     FState := OMM_PLUGIN_SUSPENDED;
     FActiveStreams := 0;
   end;
-  malloc_trim(0);
+  omm_malloc_trim;
 end;
 
 function TOmmWatchdog.Resume: Boolean;
@@ -269,7 +275,7 @@ begin
   FRssBytes := 0;
   FActiveStreams := 0;
   FIdleSeconds := 0;
-  malloc_trim(0);
+  omm_malloc_trim;
 end;
 
 procedure TOmmWatchdog.RecordActivity;

@@ -4,7 +4,7 @@ library libcodec_ogg;
 {$PACKRECORDS C}
 
 uses
-  dynlibs, ctypes, omm_codec_abi;
+  dynlibs, ctypes, omm_codec_abi, omm_os;
 
 const
   SFM_READ = $10;
@@ -233,7 +233,7 @@ begin
 
   SniffOggSecondaryHeader(h);
 
-  h^.SndLib := LoadLibrary('libsndfile.so.1');
+  h^.SndLib := LoadSndFileLibrary;
   if h^.SndLib <> NilHandle then
   begin
     Pointer(h^.fnOpenVirtual) := GetProcedureAddress(h^.SndLib, 'sf_open_virtual');

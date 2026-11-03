@@ -69,7 +69,93 @@ pub fn get_lyrics_for_uri(uri: &str) -> String {
     if uri.is_empty() {
         return String::new();
     }
-    // Standard mock lyrics for streaming URIs
+
+    if let Some(rest) = uri.strip_prefix("netease://") {
+        let song_id = rest.strip_prefix("track/").unwrap_or(rest).trim();
+        if !song_id.is_empty() && song_id.chars().all(|c| c.is_ascii_digit()) {
+            let api_url = format!(
+                "https://music.163.com/api/song/lyric?id={}&lv=1&kv=1&tv=-1",
+                song_id
+            );
+            if let Ok(output) = std::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-L",
+                    "--max-time",
+                    "4",
+                    "-H",
+                    "Referer: https://music.163.com/",
+                    "-H",
+                    "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                    &api_url,
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        if let Some(lrc) = val
+                            .get("lrc")
+                            .and_then(|l| l.get("lyric"))
+                            .and_then(|s| s.as_str())
+                        {
+                            let trimmed = lrc.trim();
+                            if !trimmed.is_empty() {
+                                return trimmed.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(rest) = uri.strip_prefix("qq://") {
+        let song_mid = rest.strip_prefix("track/").unwrap_or(rest).trim();
+        if !song_mid.is_empty() {
+            let api_url = format!(
+                "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid={}&format=json&nobase64=1",
+                song_mid
+            );
+            if let Ok(output) = std::process::Command::new("curl")
+                .args([
+                    "-s",
+                    "-L",
+                    "--max-time",
+                    "4",
+                    "-H",
+                    "Referer: https://y.qq.com/",
+                    "-H",
+                    "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                    &api_url,
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        if let Some(lrc) = val.get("lyric").and_then(|s| s.as_str()) {
+                            let trimmed = lrc
+                                .replace("&#58;", ":")
+                                .replace("&#46;", ".")
+                                .replace("&#10;", "\n")
+                                .replace("&#13;", "")
+                                .replace("&#32;", " ")
+                                .replace("&#45;", "-")
+                                .replace("&#40;", "(")
+                                .replace("&#41;", ")")
+                                .replace("&apos;", "'")
+                                .replace("&quot;", "\"")
+                                .replace("&amp;", "&");
+                            if !trimmed.trim().is_empty() {
+                                return trimmed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if uri.starts_with("bilibili://") {
+        return "[00:00.00] [Bilibili 视频音频流 — 该视频源暂无 LRC 同步歌词]\n".to_string();
+    }
+
+    // Standard fallback lyrics for test/mock URIs
     let lines = vec![
         LyricLine { timestamp_ms: 1000, text: "Oh-My-Mineral Synchronized Lyrics".to_string() },
         LyricLine { timestamp_ms: 12500, text: "Hello Oh-My-Mineral Lyrics".to_string() },

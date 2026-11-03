@@ -4,9 +4,7 @@ library libcodec_sysbridge;
 {$PACKRECORDS C}
 
 uses
-  BaseUnix, dynlibs, ctypes, omm_codec_abi;
-
-function c_system(cmd: PAnsiChar): cint; cdecl; external 'c' name 'system';
+  {$IFDEF UNIX}BaseUnix,{$ENDIF} dynlibs, ctypes, omm_codec_abi, omm_os;
 
 const
   SFM_READ = $10;
@@ -338,7 +336,7 @@ begin
   h^.SampleRate := 44100;
   h^.Channels := 2;
 
-  h^.SndLib := LoadLibrary('libsndfile.so.1');
+  h^.SndLib := LoadSndFileLibrary;
   if h^.SndLib <> NilHandle then
   begin
     Pointer(h^.fnOpen)        := GetProcedureAddress(h^.SndLib, 'sf_open');
