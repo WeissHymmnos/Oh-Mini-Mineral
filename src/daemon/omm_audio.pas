@@ -2,6 +2,7 @@ unit omm_audio;
 
 {$mode objfpc}{$H+}
 {$PACKRECORDS C}
+{$pointermath on}
 
 interface
 
@@ -835,7 +836,7 @@ type
   end;
   PWaveHdr = ^TWaveHdr;
 
-function waveOutOpen(lphWaveOut: PHandle; uDeviceID: UINT; lpFormat: PWaveFormatEx;
+function waveOutOpen(lphWaveOut: Pointer; uDeviceID: UINT; lpFormat: PWaveFormatEx;
   dwCallback, dwInstance: PtrUInt; dwFlags: DWORD): DWORD; stdcall; external 'winmm.dll' name 'waveOutOpen';
 function waveOutPrepareHeader(hWaveOut: THandle; lpWaveOutHdr: PWaveHdr; uSize: UINT): DWORD; stdcall; external 'winmm.dll' name 'waveOutPrepareHeader';
 function waveOutUnprepareHeader(hWaveOut: THandle; lpWaveOutHdr: PWaveHdr; uSize: UINT): DWORD; stdcall; external 'winmm.dll' name 'waveOutUnprepareHeader';

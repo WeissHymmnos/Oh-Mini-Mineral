@@ -2,6 +2,7 @@ unit omm_os;
 
 {$mode objfpc}{$H+}
 {$PACKRECORDS C}
+{$pointermath on}
 
 interface
 

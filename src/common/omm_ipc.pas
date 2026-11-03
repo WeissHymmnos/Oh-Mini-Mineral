@@ -21,7 +21,12 @@ const
   OMM_PROTOCOL_VERSION    = 1;
   OMM_PACKET_SIZE         = 512;
   OMM_PAYLOAD_SIZE        = 496;
+  {$IFDEF DARWIN}
+  MSG_NOSIGNAL            = 0;
+  SO_NOSIGPIPE            = $1022;
+  {$ELSE}
   MSG_NOSIGNAL            = $4000; // Do not generate SIGPIPE if peer closed socket
+  {$ENDIF}
 
   // Request Opcodes (0x0001 - 0x00FF)
   OP_REQ_PING              = $0001;
@@ -178,11 +183,6 @@ begin
   Packet.StatusCode := StatusCode;
 end;
 
-{$IFDEF DARWIN}
-const
-  MSG_NOSIGNAL = 0;
-  SO_NOSIGPIPE = $1022;
-{$ENDIF}
 
 {$IFDEF WINDOWS}
 function SocketPathToPort(const SocketPath: string): Word;

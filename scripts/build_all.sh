@@ -12,20 +12,19 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${WORKSPACE_ROOT}"
+
 OS_UNAME="$(uname -s)"
 case "${OS_UNAME}" in
     MINGW*|MSYS*|CYGWIN*|Windows_NT*)
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"
-        WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -W)"
-        ;;
-    *)
-        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-        WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+        export MSYS2_ARG_CONV_EXCL="*"
         ;;
 esac
 SYSROOT_FPC="${WORKSPACE_ROOT}/.sysroot/fpc"
-BIN_DIR="${WORKSPACE_ROOT}/bin"
-UNITS_ROOT="${WORKSPACE_ROOT}/target/fpc-units"
+BIN_DIR="bin"
+UNITS_ROOT="target/fpc-units"
 
 case "${OS_UNAME}" in
     Linux*)
@@ -190,8 +189,8 @@ compile_fpc_target() {
 # ------------------------------------------------------------------------------
 build_codecs() {
     echo "=== Building Target: Pure Pascal Lazy Codec Pool (bin/codecs/*${LIB_EXT}) ==="
-    local CODECS_SRC_DIR="${WORKSPACE_ROOT}/src/codecs"
-    local COMMON_DIR="${WORKSPACE_ROOT}/src/common"
+    local CODECS_SRC_DIR="src/codecs"
+    local COMMON_DIR="src/common"
     local CODECS_BIN_DIR="${BIN_DIR}/codecs"
 
     mkdir -p "${CODECS_BIN_DIR}"
@@ -219,8 +218,8 @@ build_codecs() {
 # ------------------------------------------------------------------------------
 build_daemon() {
     echo "=== Building Target: omm_daemon${EXE_EXT} (100% Pure Free Pascal Microkernel) ==="
-    local DAEMON_DIR="${WORKSPACE_ROOT}/src/daemon"
-    local COMMON_DIR="${WORKSPACE_ROOT}/src/common"
+    local DAEMON_DIR="src/daemon"
+    local COMMON_DIR="src/common"
     local DAEMON_LPR="${DAEMON_DIR}/omm_daemon.lpr"
     local DAEMON_BIN="${BIN_DIR}/omm_daemon${EXE_EXT}"
 
@@ -246,8 +245,8 @@ build_daemon() {
 # ------------------------------------------------------------------------------
 build_tui() {
     echo "=== Building Target: omm_tui${EXE_EXT} ==="
-    local TUI_DIR="${WORKSPACE_ROOT}/src/tui"
-    local COMMON_DIR="${WORKSPACE_ROOT}/src/common"
+    local TUI_DIR="src/tui"
+    local COMMON_DIR="src/common"
     local TUI_PAS="${TUI_DIR}/omm_tui.pas"
     local TUI_BIN="${BIN_DIR}/omm_tui${EXE_EXT}"
 
@@ -260,7 +259,7 @@ build_tui() {
     compile_fpc_target "${TUI_BIN}" "tui" \
         -Fu"${COMMON_DIR}" \
         -Fu"${TUI_DIR}" \
-        -Fu"${WORKSPACE_ROOT}/src/daemon" \
+        -Fusrc/daemon \
         -XX -Xs -Os \
         "${TUI_PAS}"
 
@@ -272,8 +271,8 @@ build_tui() {
 # ------------------------------------------------------------------------------
 build_gui() {
     echo "=== Building Target: omm_gui${EXE_EXT} (${WIDGETSET}) ==="
-    local GUI_DIR="${WORKSPACE_ROOT}/src/gui"
-    local COMMON_DIR="${WORKSPACE_ROOT}/src/common"
+    local GUI_DIR="src/gui"
+    local COMMON_DIR="src/common"
     local GUI_LPR="${GUI_DIR}/omm_gui.lpr"
     local GUI_LPI="${GUI_DIR}/omm_gui.lpi"
     local GUI_BIN="${BIN_DIR}/omm_gui${EXE_EXT}"
@@ -290,7 +289,7 @@ build_gui() {
             -FU"${UNITS_ROOT}/gui" \
             -Fu"${COMMON_DIR}" \
             -Fu"${GUI_DIR}" \
-            -Fu"${WORKSPACE_ROOT}/src/daemon" \
+            -Fusrc/daemon \
             -Fu"${SYSROOT_FPC}/usr/lib64/lazarus/lcl/units/x86_64-linux" \
             -Fu"${SYSROOT_FPC}/usr/lib64/lazarus/lcl/units/x86_64-linux/gtk2" \
             -Fu"${SYSROOT_FPC}/usr/lib64/lazarus/components/lazutils/lib/x86_64-linux" \
@@ -325,7 +324,7 @@ build_gui() {
 # ------------------------------------------------------------------------------
 build_plugin() {
     echo "=== Building Target: libomm_mineral${LIB_EXT} ==="
-    local PLUGIN_CRATE="${WORKSPACE_ROOT}/crates/omm-mineral"
+    local PLUGIN_CRATE="crates/omm-mineral"
     local PLUGIN_TOML="${PLUGIN_CRATE}/Cargo.toml"
     local DEST_LIB="${BIN_DIR}/libomm_mineral${LIB_EXT}"
 
@@ -337,11 +336,11 @@ build_plugin() {
     if [[ "${PLATFORM}" == "macos" ]] && command -v rustup >/dev/null 2>&1 && command -v lipo >/dev/null 2>&1; then
         echo "Compiling Universal (x86_64 + aarch64) libomm_mineral.dylib on macOS..."
         rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
-        if cargo build --manifest-path "${PLUGIN_TOML}" --target-dir "${WORKSPACE_ROOT}/target" --target x86_64-apple-darwin --release && \
-           cargo build --manifest-path "${PLUGIN_TOML}" --target-dir "${WORKSPACE_ROOT}/target" --target aarch64-apple-darwin --release; then
+        if cargo build --manifest-path "${PLUGIN_TOML}" --target-dir target --target x86_64-apple-darwin --release && \
+           cargo build --manifest-path "${PLUGIN_TOML}" --target-dir target --target aarch64-apple-darwin --release; then
             lipo -create -output "${DEST_LIB}" \
-                "${WORKSPACE_ROOT}/target/x86_64-apple-darwin/release/libomm_mineral.dylib" \
-                "${WORKSPACE_ROOT}/target/aarch64-apple-darwin/release/libomm_mineral.dylib"
+                "target/x86_64-apple-darwin/release/libomm_mineral.dylib" \
+                "target/aarch64-apple-darwin/release/libomm_mineral.dylib"
             local size
             size="$(file_size "${DEST_LIB}")"
             echo "  [PASS] Universal libomm_mineral.dylib size: $(format_size "${size}")"
@@ -350,13 +349,13 @@ build_plugin() {
     fi
 
     echo "Compiling omm-mineral crate via cargo build --release..."
-    cargo build --manifest-path "${PLUGIN_TOML}" --target-dir "${WORKSPACE_ROOT}/target" --release
+    cargo build --manifest-path "${PLUGIN_TOML}" --target-dir target --release
 
     local TARGET_LIB=""
-    if [[ -f "${WORKSPACE_ROOT}/target/release/libomm_mineral${LIB_EXT}" ]]; then
-        TARGET_LIB="${WORKSPACE_ROOT}/target/release/libomm_mineral${LIB_EXT}"
-    elif [[ -f "${WORKSPACE_ROOT}/target/release/omm_mineral${LIB_EXT}" ]]; then
-        TARGET_LIB="${WORKSPACE_ROOT}/target/release/omm_mineral${LIB_EXT}"
+    if [[ -f "target/release/libomm_mineral${LIB_EXT}" ]]; then
+        TARGET_LIB="target/release/libomm_mineral${LIB_EXT}"
+    elif [[ -f "target/release/omm_mineral${LIB_EXT}" ]]; then
+        TARGET_LIB="target/release/omm_mineral${LIB_EXT}"
     fi
 
     if [[ -n "${TARGET_LIB}" && -f "${TARGET_LIB}" ]]; then
@@ -377,7 +376,7 @@ build_plugin() {
             fi
         fi
     else
-        echo "  [FAIL] Built plugin library not found in ${WORKSPACE_ROOT}/target/release/" >&2
+        echo "  [FAIL] Built plugin library not found in target/release/" >&2
         return 1
     fi
 }
@@ -389,9 +388,9 @@ clean_all() {
     echo "=== Cleaning build artifacts ==="
     rm -rf "${BIN_DIR}"
     rm -rf "${UNITS_ROOT}"
-    rm -rf "${WORKSPACE_ROOT}/src/gui/lib"
-    rm -f "${WORKSPACE_ROOT}/src/daemon/miniaudio_wrapper.o"
-    find "${WORKSPACE_ROOT}/src" -type f \( -name "*.o" -o -name "*.or" -o -name "*.ppu" -o -name "*.compiled" -o -name "*.a" -o -name "*.res" \) -delete
+    rm -rf "src/gui/lib"
+    rm -f "src/daemon/miniaudio_wrapper.o"
+    find "src" -type f \( -name "*.o" -o -name "*.or" -o -name "*.ppu" -o -name "*.compiled" -o -name "*.a" -o -name "*.res" \) -delete
     echo "Done."
 }
 

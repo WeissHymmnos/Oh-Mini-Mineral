@@ -418,6 +418,8 @@ end;
 procedure TermInit(var Term: TTerminalState);
 {$IFDEF WINDOWS}
 const
+  ENABLE_LINE_INPUT                  = $0002;
+  ENABLE_ECHO_INPUT                  = $0004;
   ENABLE_VIRTUAL_TERMINAL_PROCESSING = $0004;
   ENABLE_VIRTUAL_TERMINAL_INPUT      = $0200;
 var
