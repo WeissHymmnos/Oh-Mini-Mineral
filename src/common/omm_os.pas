@@ -540,8 +540,7 @@ begin
   if (oldpath = nil) or (newpath = nil) then Exit(-1);
   normOld := NormalizeOmmPath(AnsiString(oldpath));
   normNew := NormalizeOmmPath(AnsiString(newpath));
-  if MoveFileExA(PAnsiChar(normOld), PAnsiChar(normNew),
-     MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH) then
+  if MoveFileExA(PAnsiChar(normOld), PAnsiChar(normNew), $00000001 or $00000008) then
     Result := 0
   else
     Result := -1;

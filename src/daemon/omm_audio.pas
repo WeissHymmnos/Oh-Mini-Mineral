@@ -140,7 +140,8 @@ var
   GSectionLock: TRTLCriticalSection;
   GInitialized: Boolean = False;
   GTerminateThread: Boolean = False;
-  GThreadID: TThreadID = 0;
+  GThreadActive: Boolean = False;
+  GThreadID: TThreadID;
 
   GPlaybackState: UInt32 = OMM_STATE_STOPPED;
   GFlushHardware: Boolean = False;
@@ -1344,6 +1345,7 @@ begin
 
   GInitialized := True;
   GThreadID := BeginThread(@AudioPumpThread, nil);
+  GThreadActive := True;
   Result := 0;
 end;
 
@@ -1353,10 +1355,10 @@ var
 begin
   if not GInitialized then Exit;
   GTerminateThread := True;
-  if GThreadID <> 0 then
+  if GThreadActive then
   begin
     WaitForThreadTerminate(GThreadID, 1000);
-    GThreadID := 0;
+    GThreadActive := False;
   end;
 
   EnterCriticalSection(GSectionLock);
