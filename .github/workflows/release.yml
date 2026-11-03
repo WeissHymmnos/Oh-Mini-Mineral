@@ -75,7 +75,33 @@ jobs:
 
       - name: Install Free Pascal & Lazarus (macOS Cocoa)
         run: |
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install fpc
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install fpc lld
+          mkdir -p /tmp/darwin-lld
+          ln -sf /usr/bin/as /tmp/darwin-lld/as
+          ln -sf /usr/bin/clang /tmp/darwin-lld/clang
+          ln -sf /usr/bin/ar /tmp/darwin-lld/ar
+          ln -sf /usr/bin/strip /tmp/darwin-lld/strip
+          cat > /tmp/darwin-lld/ld <<'SHIM'
+          #!/bin/bash
+          LD64_LLD=$(command -v ld64.lld 2>/dev/null || ls /opt/homebrew/bin/ld64.lld /usr/local/bin/ld64.lld 2>/dev/null | head -n1)
+          args=()
+          while [ $# -gt 0 ]; do
+              case "$1" in
+                  -macosx_version_min|-macos_version_min)
+                      args+=(-platform_version macos "$2" "$2")
+                      shift 2 ;;
+                  -no_dead_strip_inits_and_terms)
+                      shift ;;
+                  -multiply_defined)
+                      shift 2 ;;
+                  *)
+                      args+=("$1"); shift ;;
+              esac
+          done
+          exec "$LD64_LLD" "${args[@]}"
+          SHIM
+          chmod +x /tmp/darwin-lld/ld
+          echo "-FD/tmp/darwin-lld" >> "$(brew --prefix)/etc/fpc.cfg"
           curl -sL "https://gitlab.com/freepascal.org/lazarus/lazarus/-/archive/lazarus_3_6/lazarus-lazarus_3_6.tar.gz" | tar -xz -C /tmp
           rm -rf /tmp/lazarus
           mv /tmp/lazarus-lazarus_3_6 /tmp/lazarus
