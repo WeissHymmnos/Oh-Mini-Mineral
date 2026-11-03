@@ -41,6 +41,7 @@ jobs:
         uses: gcarreno/setup-lazarus@v3
         with:
           lazarus-version: "dist"
+          with-cache: true
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -125,6 +126,7 @@ jobs:
         uses: gcarreno/setup-lazarus@v3
         with:
           lazarus-version: "dist"
+          with-cache: true
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable

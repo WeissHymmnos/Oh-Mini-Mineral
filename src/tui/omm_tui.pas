@@ -810,9 +810,13 @@ begin
 
     if retries > 8 then
     begin
+      {$IFDEF CPUX86_64}
       asm
         pause
       end;
+      {$ELSE}
+      ReadBarrier;
+      {$ENDIF}
     end;
   until retries >= 16;
 end;
