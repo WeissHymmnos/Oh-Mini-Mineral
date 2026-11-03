@@ -53,6 +53,7 @@ type
 
     procedure CheckPrefetchTrigger;
     procedure SetNextPrefetch(TrackID: UInt32; const URI: string);
+    procedure RefreshLyricsIfNeeded;
 
     property CurrentURI: string read FCurrentURI;
     property CurrentTrackID: UInt32 read FCurrentTrackID;
@@ -131,6 +132,12 @@ begin
     SeqLockWriteBegin(FPShm^.SeqLock);
     FillChar(FPShm^.LyricCurrent[0], SizeOf(FPShm^.LyricCurrent), 0);
     FillChar(FPShm^.LyricNext[0], SizeOf(FPShm^.LyricNext), 0);
+    FPShm^.LyricTimestampMs := 0;
+    FPShm^.LyricLineIdx := 0;
+    FPShm^.LrcLineCount := 0;
+    FPShm^.LrcTextLen := 0;
+    FillChar(FPShm^.LrcRawText[0], SizeOf(FPShm^.LrcRawText), 0);
+    Inc(FPShm^.LrcGeneration);
     SeqLockWriteEnd(FPShm^.SeqLock);
   end;
 end;
@@ -253,12 +260,13 @@ end;
 
 procedure TOmmRouter.LoadLyricsForTrack(Scheme: TURIScheme; const CleanTarget: string);
 var
-  lrcPath, rawLrc: string;
+  lrcPath, rawLrc, searchQuery, tTitle, tArtist, canonLrc: string;
   f: File;
   fileSz: Int64;
-  bytesRead: SizeInt;
+  bytesRead, bytesWritten: SizeInt;
   lrcBuf: array[0..32767] of Byte;
   outLen: SizeUInt;
+  i, mins, secs, csecs: Integer;
 begin
   ClearLyrics;
   rawLrc := '';
@@ -287,6 +295,39 @@ begin
         end;
         CloseFile(f);
       end;
+    end
+    else if (FWatchdog <> nil) and (FWatchdog.State <> OMM_PLUGIN_UNLOADED) and (FPShm <> nil) then
+    begin
+      // If plugin is already awake, auto-resolve lyrics by Title + Artist and cache .lrc sidecar
+      tTitle := Trim(StrPas(@FPShm^.TrackTitle[0]));
+      tArtist := Trim(StrPas(@FPShm^.TrackArtist[0]));
+      if tTitle <> '' then
+      begin
+        if tArtist <> '' then
+          searchQuery := 'search://' + tTitle + ' ' + tArtist
+        else
+          searchQuery := 'search://' + tTitle;
+        outLen := 0;
+        FillChar(lrcBuf[0], SizeOf(lrcBuf), 0);
+        if (FWatchdog.FetchLyrics(searchQuery, @lrcBuf[0], SizeOf(lrcBuf) - 1, outLen) = OMM_OK) and
+           (outLen > 0) then
+        begin
+          if outLen >= SizeOf(lrcBuf) then
+            outLen := SizeOf(lrcBuf) - 1;
+          SetLength(rawLrc, outLen);
+          Move(lrcBuf[0], rawLrc[1], outLen);
+          lrcPath := ChangeFileExt(CleanTarget, '.lrc');
+          AssignFile(f, lrcPath);
+          {$I-}
+          Rewrite(f, 1);
+          {$I+}
+          if IOResult = 0 then
+          begin
+            BlockWrite(f, rawLrc[1], Length(rawLrc), bytesWritten);
+            CloseFile(f);
+          end;
+        end;
+      end;
     end;
   end
   else if (Scheme = usMineralStream) and (FWatchdog <> nil) then
@@ -306,7 +347,41 @@ begin
   if rawLrc <> '' then
     ParseLrcContent(rawLrc);
 
-  SyncLyricsToSHM(0, True);
+  if (FPShm <> nil) and (FLyricCount > 0) then
+  begin
+    canonLrc := '';
+    for i := 0 to FLyricCount - 1 do
+    begin
+      mins := (FLyrics[i].TimestampMs div 1000) div 60;
+      secs := (FLyrics[i].TimestampMs div 1000) mod 60;
+      csecs := (FLyrics[i].TimestampMs mod 1000) div 10;
+      canonLrc := canonLrc + Format('[%.2d:%.2d.%.2d]%s'#10, [mins, secs, csecs, FLyrics[i].Text]);
+      if Length(canonLrc) >= SizeOf(FPShm^.LrcRawText) - 256 then
+        Break;
+    end;
+
+    SeqLockWriteBegin(FPShm^.SeqLock);
+    FPShm^.LrcLineCount := UInt32(FLyricCount);
+    FPShm^.LrcTextLen := UInt32(Min(Length(canonLrc), SizeOf(FPShm^.LrcRawText) - 1));
+    FillChar(FPShm^.LrcRawText[0], SizeOf(FPShm^.LrcRawText), 0);
+    if FPShm^.LrcTextLen > 0 then
+      Move(canonLrc[1], FPShm^.LrcRawText[0], FPShm^.LrcTextLen);
+    Inc(FPShm^.LrcGeneration);
+    SeqLockWriteEnd(FPShm^.SeqLock);
+  end;
+
+  SyncLyricsToSHM(omm_audio_get_position_ms(), True);
+end;
+
+procedure TOmmRouter.RefreshLyricsIfNeeded;
+var
+  scheme: TURIScheme;
+  cleanTarget: string;
+begin
+  if (FLyricCount > 0) or (FCurrentURI = '') then Exit;
+  scheme := ParseScheme(FCurrentURI, cleanTarget);
+  if scheme <> usUnsupported then
+    LoadLyricsForTrack(scheme, cleanTarget);
 end;
 
 procedure TOmmRouter.SyncLyricsToSHM(PosMs: UInt32; ForceUpdate: Boolean);
@@ -323,6 +398,8 @@ begin
       SeqLockWriteBegin(FPShm^.SeqLock);
       FillChar(FPShm^.LyricCurrent[0], SizeOf(FPShm^.LyricCurrent), 0);
       FillChar(FPShm^.LyricNext[0], SizeOf(FPShm^.LyricNext), 0);
+      FPShm^.LyricTimestampMs := 0;
+      FPShm^.LyricLineIdx := 0;
       SeqLockWriteEnd(FPShm^.SeqLock);
     end;
     Exit;
@@ -348,6 +425,8 @@ begin
     nextStr := '';
 
   SeqLockWriteBegin(FPShm^.SeqLock);
+  FPShm^.LyricLineIdx := UInt32(idx);
+  FPShm^.LyricTimestampMs := FLyrics[idx].TimestampMs;
   FillChar(FPShm^.LyricCurrent[0], SizeOf(FPShm^.LyricCurrent), 0);
   if curStr <> '' then
     Move(curStr[1], FPShm^.LyricCurrent[0], Min(Length(curStr), SizeOf(FPShm^.LyricCurrent) - 1));

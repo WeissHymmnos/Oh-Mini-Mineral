@@ -408,6 +408,8 @@ begin
         pShm^.PluginState := OMM_PLUGIN_ACTIVE;
         SeqLockWriteEnd(pShm^.SeqLock);
       end;
+      if Req.Payload.Raw[0] = 1 then
+        Router.RefreshLyricsIfNeeded;
       InitPacket(resp, OP_RESP_OK, Req.SeqID, OMM_OK);
       SendPacket(ClientFD, resp);
     end;

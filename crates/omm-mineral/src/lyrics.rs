@@ -151,6 +151,25 @@ pub fn get_lyrics_for_uri(uri: &str) -> String {
                 }
             }
         }
+    } else if let Some(query) = uri.strip_prefix("search://") {
+        let q = query.trim();
+        if !q.is_empty() {
+            if let Ok(tracks) = crate::online::search_online_tracks(&format!("netease:{}", q), 1) {
+                if let Some(first) = tracks.first() {
+                    let len = first
+                        .uri
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(first.uri.len());
+                    if let Ok(net_uri) = std::str::from_utf8(&first.uri[..len]) {
+                        if net_uri.starts_with("netease://") {
+                            return get_lyrics_for_uri(net_uri);
+                        }
+                    }
+                }
+            }
+        }
+        return String::new();
     } else if uri.starts_with("bilibili://") {
         return "[00:00.00] [Bilibili 视频音频流 — 该视频源暂无 LRC 同步歌词]\n".to_string();
     }

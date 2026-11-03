@@ -5,6 +5,8 @@ edition = "2021"
 publish = false
 description = "Oh-My-Mineral on-demand streaming cdylib plugin"
 
+[workspace]
+
 [lib]
 name = "omm_mineral"
 crate-type = ["cdylib", "rlib"]

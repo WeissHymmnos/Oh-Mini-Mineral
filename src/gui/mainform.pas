@@ -11,10 +11,16 @@ uses
 const
   MAX_CACHE_ITEMS = 128;
   ROW_HEIGHT      = 23;
+  LYRIC_LINE_H    = 22;
   MINI_H_THRESH   = 185;
   RIGHT_PANE_MINW = 680;
 
 type
+  TGuiLyricLine = record
+    TimestampMs: UInt32;
+    Text: string;
+  end;
+
   { TMainForm }
   TMainForm = class(TForm)
     pbMac: TPaintBox;
@@ -151,6 +157,30 @@ type
     FRectSetTabWY, FRectSetTabBili, FRectSetTabQQ, FRectSetTabAM: TRect;
     FRectSetBtnQR, FRectSetBtnCookie, FRectSetBtnLogout: TRect;
 
+    // Right Sidebar Toggleable Lyrics / Track Information State
+    FLyricsMode: Boolean;
+    FLastLrcGen: UInt32;
+    FLastOnlineLrcReqTrackID: UInt32;
+    FGuiLyrics: array of TGuiLyricLine;
+    FGuiLyricCount: Integer;
+    FActiveLyricIdx: Integer;
+    FLyricScrollY: Single;
+    FLyricTargetScrollY: Single;
+    FLyricManualScrollTick: Int64;
+    FLyricCurFallback: string;
+    FLyricNextFallback: string;
+    FRectRightHeader: TRect;
+    FRectDetailsCard: TRect;
+
+    // Ultra-Low-Memory 42x42 Album Cover Thumbnail (5.2 KB static buffer)
+    FCoverBmp: TBitmap;
+    FHasCoverBmp: Boolean;
+    FCoverLoadedPath: string;
+
+    procedure EnsureCoverThumbLoaded(const ATrackPath: string);
+    procedure ParseGuiLrcText(const RawLrc: string);
+    procedure UpdateActiveLyricLine(PosMs: UInt32; ImmediateJump: Boolean = False);
+    procedure RequestOnlineLyricsForCurrentTrack;
     procedure ConnectIPC;
     procedure DisconnectIPC;
     function SendSafePacket(const Packet: TOMMPacket): Boolean;
@@ -201,6 +231,17 @@ var
 implementation
 
 {$R *.lfm}
+
+{$IFDEF LINUX}
+function gdk_pixbuf_new_from_file_at_scale(filename: PAnsiChar; width, height: cint; preserve_aspect_ratio: LongBool; error: Pointer): Pointer; cdecl; external 'libgdk_pixbuf-2.0.so.0';
+function gdk_pixbuf_get_pixels(pixbuf: Pointer): PByte; cdecl; external 'libgdk_pixbuf-2.0.so.0';
+function gdk_pixbuf_get_rowstride(pixbuf: Pointer): cint; cdecl; external 'libgdk_pixbuf-2.0.so.0';
+function gdk_pixbuf_get_n_channels(pixbuf: Pointer): cint; cdecl; external 'libgdk_pixbuf-2.0.so.0';
+function gdk_pixbuf_get_width(pixbuf: Pointer): cint; cdecl; external 'libgdk_pixbuf-2.0.so.0';
+function gdk_pixbuf_get_height(pixbuf: Pointer): cint; cdecl; external 'libgdk_pixbuf-2.0.so.0';
+procedure g_object_unref(obj: Pointer); cdecl; external 'libgobject-2.0.so.0';
+function malloc_trim(pad: csize_t): cint; cdecl; external 'libc.so.6';
+{$ENDIF}
 
 function SanitizeSingle(Val: Single; MinVal, MaxVal, DefVal: Single): Single;
 begin
@@ -262,6 +303,12 @@ begin
   FBackBuffer := TBitmap.Create;
   FBackBuffer.PixelFormat := pf24bit;
 
+  FCoverBmp := TBitmap.Create;
+  FCoverBmp.PixelFormat := pf24bit;
+  FCoverBmp.SetSize(42, 42);
+  FHasCoverBmp := False;
+  FCoverLoadedPath := '';
+
   FSocketFD := -1;
   FPShm := nil;
   FLibEngine := nil;
@@ -306,6 +353,20 @@ begin
   FFilterActive := False;
   FOscilloscopeMode := False;
   FLastSyncedTrackID := 0;
+
+  FLyricsMode := False;
+  FLastLrcGen := 0;
+  FLastOnlineLrcReqTrackID := 0;
+  FGuiLyricCount := 0;
+  FActiveLyricIdx := 0;
+  FLyricScrollY := 0.0;
+  FLyricTargetScrollY := 0.0;
+  FLyricManualScrollTick := 0;
+  FLyricCurFallback := '';
+  FLyricNextFallback := '';
+  SetLength(FGuiLyrics, 0);
+  FRectRightHeader := Rect(0, 0, 0, 0);
+  FRectDetailsCard := Rect(0, 0, 0, 0);
 
   FSettingsOpen := False;
   FSettingsTab := 0;
@@ -415,11 +476,493 @@ begin
     FBackBuffer.Free;
     FBackBuffer := nil;
   end;
+  if FCoverBmp <> nil then
+  begin
+    FCoverBmp.Free;
+    FCoverBmp := nil;
+  end;
 end;
 
 procedure TMainForm.FormResize(Sender: TObject);
 begin
   pbMac.Invalidate;
+end;
+
+function ExtractJsonField(const S, Key: string): string; forward;
+
+function ExtractAudioCoverToFile(const AudioPath, OutImgPath: string): Boolean;
+{$IFDEF UNIX}
+var
+  fdIn, fdOut: cint;
+  hdr: array[0..9] of Byte;
+  chunk: array[0..4095] of Byte;
+  apicHdr: array[0..255] of Byte;
+  tagSize, scanPos, scanEnd, apicPos, imgOffset, frameSize, copyRem: Int64;
+  nRead, i, headRead, toRead: cint;
+  ver: Byte;
+  b0, b1, b2, b3: UInt32;
+  isLastBlock: Boolean;
+{$ENDIF}
+begin
+  Result := False;
+  {$IFDEF UNIX}
+  fdIn := fpOpen(PChar(AudioPath), O_RDONLY);
+  if fdIn < 0 then Exit;
+  try
+    if fpRead(fdIn, hdr[0], 10) <> 10 then Exit;
+
+    // 1. ID3v2 (MP3 / TrueHD / etc.) with zero-heap 4 KB stack chunk scanner
+    if (hdr[0] = Ord('I')) and (hdr[1] = Ord('D')) and (hdr[2] = Ord('3')) then
+    begin
+      ver := hdr[3];
+      tagSize := ((Int64(hdr[6]) and $7F) shl 21) or
+                 ((Int64(hdr[7]) and $7F) shl 14) or
+                 ((Int64(hdr[8]) and $7F) shl 7) or
+                 (Int64(hdr[9]) and $7F);
+      if tagSize <= 32 then Exit;
+
+      scanEnd := 10 + Min(tagSize, 131072);
+      scanPos := 10;
+      apicPos := -1;
+      while scanPos < scanEnd do
+      begin
+        if fpLseek(fdIn, scanPos, SEEK_SET) < 0 then Break;
+        nRead := fpRead(fdIn, chunk[0], Min(Int64(SizeOf(chunk)), scanEnd - scanPos));
+        if nRead < 8 then Break;
+        for i := 0 to nRead - 5 do
+        begin
+          if (chunk[i] = Ord('A')) and (chunk[i + 1] = Ord('P')) and
+             (chunk[i + 2] = Ord('I')) and (chunk[i + 3] = Ord('C')) then
+          begin
+            apicPos := scanPos + i;
+            Break;
+          end;
+        end;
+        if apicPos >= 0 then Break;
+        Inc(scanPos, nRead - 4);
+      end;
+
+      if apicPos >= 10 then
+      begin
+        if fpLseek(fdIn, apicPos, SEEK_SET) < 0 then Exit;
+        headRead := fpRead(fdIn, apicHdr[0], SizeOf(apicHdr));
+        if headRead < 24 then Exit;
+
+        b0 := apicHdr[4]; b1 := apicHdr[5]; b2 := apicHdr[6]; b3 := apicHdr[7];
+        if ver = 4 then
+        begin
+          frameSize := ((b0 and $7F) shl 21) or ((b1 and $7F) shl 14) or ((b2 and $7F) shl 7) or (b3 and $7F);
+          if (frameSize < 64) or (apicPos + 10 + frameSize > 10 + tagSize) then
+            frameSize := (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3;
+        end
+        else
+          frameSize := (b0 shl 24) or (b1 shl 16) or (b2 shl 8) or b3;
+
+        if (frameSize <= 32) or (frameSize > 8388608) then
+          frameSize := (10 + tagSize) - (apicPos + 10);
+
+        imgOffset := -1;
+        for i := 10 to headRead - 4 do
+        begin
+          if ((apicHdr[i] = $FF) and (apicHdr[i + 1] = $D8) and (apicHdr[i + 2] = $FF)) or
+             ((apicHdr[i] = $89) and (apicHdr[i + 1] = Ord('P')) and (apicHdr[i + 2] = Ord('N')) and (apicHdr[i + 3] = Ord('G'))) then
+          begin
+            imgOffset := apicPos + i;
+            Break;
+          end;
+        end;
+
+        if imgOffset > apicPos then
+        begin
+          copyRem := Min((10 + tagSize) - imgOffset, frameSize - (imgOffset - (apicPos + 10)));
+          if (copyRem > 32) and (copyRem <= 8388608) then
+          begin
+            if fpLseek(fdIn, imgOffset, SEEK_SET) >= 0 then
+            begin
+              fdOut := fpOpen(PChar(OutImgPath), O_WRONLY or O_CREAT or O_TRUNC, &600);
+              if fdOut >= 0 then
+              begin
+                while copyRem > 0 do
+                begin
+                  toRead := Min(Int64(SizeOf(chunk)), copyRem);
+                  nRead := fpRead(fdIn, chunk[0], toRead);
+                  if nRead <= 0 then Break;
+                  fpWrite(fdOut, chunk[0], nRead);
+                  Dec(copyRem, nRead);
+                end;
+                fpClose(fdOut);
+                Result := True;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end
+    // 2. FLAC METADATA_BLOCK_PICTURE (Block Type 6)
+    else if (hdr[0] = Ord('f')) and (hdr[1] = Ord('L')) and (hdr[2] = Ord('a')) and (hdr[3] = Ord('C')) then
+    begin
+      scanPos := 4;
+      isLastBlock := False;
+      while (not isLastBlock) and (scanPos < 8388608) do
+      begin
+        if fpLseek(fdIn, scanPos, SEEK_SET) < 0 then Break;
+        if fpRead(fdIn, hdr[0], 4) <> 4 then Break;
+        isLastBlock := (hdr[0] and $80) <> 0;
+        ver := hdr[0] and $7F;
+        frameSize := (Int64(hdr[1]) shl 16) or (Int64(hdr[2]) shl 8) or Int64(hdr[3]);
+        if (ver = 6) and (frameSize > 64) and (frameSize <= 8388608) then
+        begin
+          headRead := fpRead(fdIn, apicHdr[0], SizeOf(apicHdr));
+          imgOffset := -1;
+          for i := 0 to headRead - 4 do
+          begin
+            if ((apicHdr[i] = $FF) and (apicHdr[i + 1] = $D8) and (apicHdr[i + 2] = $FF)) or
+               ((apicHdr[i] = $89) and (apicHdr[i + 1] = Ord('P')) and (apicHdr[i + 2] = Ord('N')) and (apicHdr[i + 3] = Ord('G'))) then
+            begin
+              imgOffset := scanPos + 4 + i;
+              Break;
+            end;
+          end;
+          if imgOffset > scanPos then
+          begin
+            copyRem := (scanPos + 4 + frameSize) - imgOffset;
+            if fpLseek(fdIn, imgOffset, SEEK_SET) >= 0 then
+            begin
+              fdOut := fpOpen(PChar(OutImgPath), O_WRONLY or O_CREAT or O_TRUNC, &600);
+              if fdOut >= 0 then
+              begin
+                while copyRem > 0 do
+                begin
+                  toRead := Min(Int64(SizeOf(chunk)), copyRem);
+                  nRead := fpRead(fdIn, chunk[0], toRead);
+                  if nRead <= 0 then Break;
+                  fpWrite(fdOut, chunk[0], nRead);
+                  Dec(copyRem, nRead);
+                end;
+                fpClose(fdOut);
+                Result := True;
+              end;
+            end;
+          end;
+          Break;
+        end;
+        Inc(scanPos, 4 + frameSize);
+      end;
+    end;
+  finally
+    fpClose(fdIn);
+  end;
+  {$ENDIF}
+end;
+
+procedure TMainForm.EnsureCoverThumbLoaded(const ATrackPath: string);
+{$IFDEF UNIX}
+var
+  cleanPath, cacheFn, tmpImgFn, songId: string;
+  hVal: QWord;
+  i, x, y, fd, idx: cint;
+  rgbBuf: array[0..5291] of Byte;
+  {$IFDEF LINUX}
+  rowstride, nchan, w, h: cint;
+  pixbuf: Pointer;
+  pixels, pRow: PByte;
+  {$ENDIF}
+{$ENDIF}
+begin
+  if ATrackPath = FCoverLoadedPath then Exit;
+  FCoverLoadedPath := ATrackPath;
+  FHasCoverBmp := False;
+  if (ATrackPath = '') or (FCoverBmp = nil) then Exit;
+
+  {$IFDEF UNIX}
+  cleanPath := ATrackPath;
+  if Copy(cleanPath, 1, 7) = 'file://' then
+    cleanPath := Copy(cleanPath, 8, Length(cleanPath) - 7);
+
+  // Compute 64-bit FNV-1a hash for 5,292-byte raw RGB thumbnail cache in /tmp
+  hVal := QWord($CBF29CE484222325);
+  for i := 1 to Length(cleanPath) do
+  begin
+    hVal := hVal xor QWord(Ord(cleanPath[i]));
+    hVal := hVal * QWord($100000001B3);
+  end;
+  cacheFn := '/tmp/omm_cov_' + IntToHex(hVal, 16) + '.rgb';
+
+  // Fast Path: Read 5,292-byte raw 42x42 RGB24 cache directly with zero image decoding!
+  if FileExists(cacheFn) then
+  begin
+    fd := fpOpen(PChar(cacheFn), O_RDONLY);
+    if fd >= 0 then
+    begin
+      if fpRead(fd, rgbBuf[0], SizeOf(rgbBuf)) = SizeOf(rgbBuf) then
+      begin
+        fpClose(fd);
+        idx := 0;
+        for y := 0 to 41 do
+          for x := 0 to 41 do
+          begin
+            FCoverBmp.Canvas.Pixels[x, y] := RGBToColor(rgbBuf[idx], rgbBuf[idx + 1], rgbBuf[idx + 2]);
+            Inc(idx, 3);
+          end;
+        FHasCoverBmp := True;
+        Exit;
+      end;
+      fpClose(fd);
+    end;
+  end;
+
+  tmpImgFn := '/tmp/omm_cov_extract.img';
+  DeleteFile(tmpImgFn);
+
+  if FileExists(cleanPath) then
+  begin
+    if not ExtractAudioCoverToFile(cleanPath, tmpImgFn) then
+    begin
+      if FileExists(ExtractFilePath(cleanPath) + 'cover.jpg') then
+        tmpImgFn := ExtractFilePath(cleanPath) + 'cover.jpg'
+      else if FileExists(ChangeFileExt(cleanPath, '.jpg')) then
+        tmpImgFn := ChangeFileExt(cleanPath, '.jpg');
+    end;
+  end
+  else if Pos('netease://', cleanPath) = 1 then
+  begin
+    songId := Copy(cleanPath, 11, 64);
+    if Pos('track/', songId) = 1 then
+      songId := Copy(songId, 7, 64);
+    if songId <> '' then
+      fpSystem('u=$(curl -sL --max-time 3 "https://music.163.com/api/song/detail/?id=' + songId + '&ids=%5B' + songId + '%5D" | grep -oE ''"picUrl":"https?://[^"]+"'' | grep -v "5639395138885805" | tail -n 1 | cut -d''"'' -f4); [ -n "$u" ] && curl -sL --max-time 3 -o "' + tmpImgFn + '" "${u}?param=84y84" >/dev/null 2>&1');
+  end
+  else if Pos('bilibili://', cleanPath) = 1 then
+  begin
+    songId := Copy(cleanPath, 12, 64);
+    if songId <> '' then
+      fpSystem('u=$(curl -sL --max-time 3 "https://api.bilibili.com/x/web-interface/view?bvid=' + songId + '" | grep -oE ''"pic":"https?://[^"]+"'' | head -n 1 | cut -d''"'' -f4); [ -n "$u" ] && curl -sL --max-time 3 -o "' + tmpImgFn + '" "${u}@84w_84h.jpg" >/dev/null 2>&1');
+  end
+  else if Pos('qq://', cleanPath) = 1 then
+  begin
+    songId := Copy(cleanPath, 6, 64);
+    if Pos('track/', songId) = 1 then
+      songId := Copy(songId, 7, 64);
+    if songId <> '' then
+      fpSystem('m=$(curl -sL --max-time 3 "https://c.y.qq.com/v8/fcg-bin/fcg_play_single_song.fcg?songmid=' + songId + '&tpl=yqq_song_detail&format=json" | grep -oE ''"album":\{[^}]*"mid":"[^"]+"'' | head -n 1 | grep -oE ''"mid":"[^"]+"'' | cut -d''"'' -f4); [ -n "$m" ] && curl -sL --max-time 3 -o "' + tmpImgFn + '" "https://y.gtimg.cn/music/photo_new/T002R90x90M000${m}.jpg" >/dev/null 2>&1');
+  end
+  else if Pos('applemusic://', cleanPath) = 1 then
+  begin
+    songId := Copy(cleanPath, 14, 64);
+    if songId <> '' then
+      fpSystem('u=$(curl -sL --max-time 3 "https://itunes.apple.com/lookup?id=' + songId + '" | grep -oE ''"artworkUrl100":"https?://[^"]+"'' | head -n 1 | cut -d''"'' -f4); [ -n "$u" ] && curl -sL --max-time 3 -o "' + tmpImgFn + '" "$u" >/dev/null 2>&1');
+  end;
+
+  if FileExists(tmpImgFn) then
+  begin
+    {$IFDEF LINUX}
+    // Decode at 42x42 scale directly via gdk-pixbuf DCT scaling in C heap, then trim
+    pixbuf := gdk_pixbuf_new_from_file_at_scale(PAnsiChar(tmpImgFn), 42, 42, False, nil);
+    if pixbuf <> nil then
+    begin
+      pixels := gdk_pixbuf_get_pixels(pixbuf);
+      rowstride := gdk_pixbuf_get_rowstride(pixbuf);
+      nchan := gdk_pixbuf_get_n_channels(pixbuf);
+      w := gdk_pixbuf_get_width(pixbuf);
+      h := gdk_pixbuf_get_height(pixbuf);
+      if (pixels <> nil) and (w >= 42) and (h >= 42) and (nchan >= 3) then
+      begin
+        idx := 0;
+        for y := 0 to 41 do
+        begin
+          pRow := pixels + (y * rowstride);
+          for x := 0 to 41 do
+          begin
+            rgbBuf[idx]     := pRow[x * nchan];
+            rgbBuf[idx + 1] := pRow[x * nchan + 1];
+            rgbBuf[idx + 2] := pRow[x * nchan + 2];
+            FCoverBmp.Canvas.Pixels[x, y] := RGBToColor(rgbBuf[idx], rgbBuf[idx + 1], rgbBuf[idx + 2]);
+            Inc(idx, 3);
+          end;
+        end;
+        fd := fpOpen(PChar(cacheFn), O_WRONLY or O_CREAT or O_TRUNC, &600);
+        if fd >= 0 then
+        begin
+          fpWrite(fd, rgbBuf[0], SizeOf(rgbBuf));
+          fpClose(fd);
+        end;
+        FHasCoverBmp := True;
+      end;
+      g_object_unref(pixbuf);
+    end;
+    if tmpImgFn = '/tmp/omm_cov_extract.img' then
+      DeleteFile(tmpImgFn);
+    malloc_trim(0);
+    {$ELSE}
+    fpSystem('ffmpeg -y -v error -i "' + tmpImgFn + '" -vf scale=42:42 -frames:v 1 -f rawvideo -pix_fmt rgb24 "' + cacheFn + '" >/dev/null 2>&1');
+    if tmpImgFn = '/tmp/omm_cov_extract.img' then
+      DeleteFile(tmpImgFn);
+    if FileExists(cacheFn) then
+    begin
+      fd := fpOpen(PChar(cacheFn), O_RDONLY);
+      if fd >= 0 then
+      begin
+        if fpRead(fd, rgbBuf[0], SizeOf(rgbBuf)) = SizeOf(rgbBuf) then
+        begin
+          idx := 0;
+          for y := 0 to 41 do
+            for x := 0 to 41 do
+            begin
+              FCoverBmp.Canvas.Pixels[x, y] := RGBToColor(rgbBuf[idx], rgbBuf[idx + 1], rgbBuf[idx + 2]);
+              Inc(idx, 3);
+            end;
+          FHasCoverBmp := True;
+        end;
+        fpClose(fd);
+      end;
+    end;
+    {$ENDIF}
+  end;
+  {$ENDIF}
+end;
+
+procedure TMainForm.ParseGuiLrcText(const RawLrc: string);
+var
+  lineStart, lineEnd, n, p, closePos, colonPos, dotPos: Integer;
+  lineStr, tagStr, minStr, secStr, fracStr, textPart: string;
+  mins, secs, frac, code: Integer;
+  tsMs: UInt32;
+  hasTs: Boolean;
+begin
+  FGuiLyricCount := 0;
+  SetLength(FGuiLyrics, 0);
+  n := Length(RawLrc);
+  lineStart := 1;
+  while lineStart <= n do
+  begin
+    lineEnd := lineStart;
+    while (lineEnd <= n) and not (RawLrc[lineEnd] in [#10, #13]) do
+      Inc(lineEnd);
+    lineStr := Trim(Copy(RawLrc, lineStart, lineEnd - lineStart));
+    lineStart := lineEnd + 1;
+    if (lineStart <= n) and (RawLrc[lineEnd] = #13) and (RawLrc[lineStart] = #10) then
+      Inc(lineStart);
+    if lineStr = '' then Continue;
+
+    hasTs := False;
+    tsMs := 0;
+    p := 1;
+    while (p <= Length(lineStr)) and (lineStr[p] = '[') do
+    begin
+      closePos := Pos(']', Copy(lineStr, p, Length(lineStr) - p + 1));
+      if closePos <= 1 then Break;
+      tagStr := Copy(lineStr, p + 1, closePos - 2);
+      colonPos := Pos(':', tagStr);
+      if colonPos > 1 then
+      begin
+        minStr := Copy(tagStr, 1, colonPos - 1);
+        Val(minStr, mins, code);
+        if code = 0 then
+        begin
+          dotPos := Pos('.', tagStr);
+          if dotPos > colonPos then
+          begin
+            secStr := Copy(tagStr, colonPos + 1, dotPos - colonPos - 1);
+            fracStr := Copy(tagStr, dotPos + 1, Length(tagStr) - dotPos);
+          end
+          else
+          begin
+            secStr := Copy(tagStr, colonPos + 1, Length(tagStr) - colonPos);
+            fracStr := '0';
+          end;
+          Val(secStr, secs, code);
+          if code = 0 then
+          begin
+            Val(fracStr, frac, code);
+            if code <> 0 then frac := 0;
+            if Length(fracStr) = 1 then frac := frac * 100
+            else if Length(fracStr) = 2 then frac := frac * 10
+            else if Length(fracStr) > 3 then
+              while frac >= 1000 do frac := frac div 10;
+            tsMs := UInt32(Max(0, mins)) * 60000 + UInt32(Max(0, secs)) * 1000 + UInt32(Max(0, frac));
+            hasTs := True;
+            p := p + closePos;
+            Continue;
+          end;
+        end;
+      end;
+      p := p + closePos;
+    end;
+
+    if hasTs then
+    begin
+      textPart := Trim(Copy(lineStr, p, Length(lineStr) - p + 1));
+      if textPart <> '' then
+      begin
+        if FGuiLyricCount >= Length(FGuiLyrics) then
+          SetLength(FGuiLyrics, Max(32, Length(FGuiLyrics) * 2));
+        FGuiLyrics[FGuiLyricCount].TimestampMs := tsMs;
+        FGuiLyrics[FGuiLyricCount].Text := textPart;
+        Inc(FGuiLyricCount);
+      end;
+    end;
+  end;
+
+  if (FGuiLyricCount > 0) and (FGuiLyrics[0].TimestampMs >= 8000) then
+  begin
+    if FGuiLyricCount >= Length(FGuiLyrics) then
+      SetLength(FGuiLyrics, FGuiLyricCount + 8);
+    for p := FGuiLyricCount downto 1 do
+      FGuiLyrics[p] := FGuiLyrics[p - 1];
+    FGuiLyrics[0].TimestampMs := 0;
+    FGuiLyrics[0].Text := '♫ Instrumental Intro...';
+    Inc(FGuiLyricCount);
+  end;
+
+  FActiveLyricIdx := 0;
+  FLyricScrollY := 0.0;
+  FLyricTargetScrollY := 0.0;
+end;
+
+procedure TMainForm.UpdateActiveLyricLine(PosMs: UInt32; ImmediateJump: Boolean);
+var
+  i, idx, visH, centerOff, maxScroll: Integer;
+begin
+  if FGuiLyricCount <= 0 then
+  begin
+    FActiveLyricIdx := 0;
+    FLyricTargetScrollY := 0.0;
+    FLyricScrollY := 0.0;
+    Exit;
+  end;
+
+  idx := 0;
+  for i := 0 to FGuiLyricCount - 1 do
+  begin
+    if FGuiLyrics[i].TimestampMs <= PosMs then
+      idx := i
+    else
+      Break;
+  end;
+
+  FActiveLyricIdx := idx;
+  if GetTickCount64 - FLyricManualScrollTick > 2500 then
+  begin
+    visH := Max(88, FRectDetailsCard.Height - 12);
+    centerOff := Max(0, (visH - LYRIC_LINE_H) div 2);
+    maxScroll := Max(0, FGuiLyricCount * LYRIC_LINE_H - visH);
+    FLyricTargetScrollY := EnsureRange(idx * LYRIC_LINE_H - centerOff, 0, maxScroll);
+  end;
+
+  if ImmediateJump then
+    FLyricScrollY := FLyricTargetScrollY;
+end;
+
+procedure TMainForm.RequestOnlineLyricsForCurrentTrack;
+var
+  pkt: TOMMPacket;
+begin
+  if (FCurrentTrackID = 0) or (FCurrentTrackID = FLastOnlineLrcReqTrackID) then Exit;
+  FLastOnlineLrcReqTrackID := FCurrentTrackID;
+  Inc(FSeqCounter);
+  InitPacket(pkt, OP_REQ_PLUGIN_WAKE, FSeqCounter);
+  pkt.Payload.Raw[0] := 1; // Trigger Router.RefreshLyricsIfNeeded
+  SendSafePacket(pkt);
 end;
 
 procedure TMainForm.ConnectIPC;
@@ -1104,6 +1647,11 @@ end;
 procedure TMainForm.DrawVinylDiscIcon(C: TCanvas; X, Y: Integer; IsSpinning: Boolean);
 begin
   DrawMacSunkenPanel(C, Rect(X, Y, X + 44, Y + 44), TColor($282C28));
+  if FHasCoverBmp and (FCoverBmp <> nil) then
+  begin
+    C.Draw(X + 1, Y + 1, FCoverBmp);
+    Exit;
+  end;
   C.Brush.Style := bsSolid;
   C.Brush.Color := clBlack;
   C.Pen.Color := TColor($888888);
@@ -2489,26 +3037,52 @@ begin
     C.Line(thumbR.Left + 3, (thumbR.Top + thumbR.Bottom) div 2,     thumbR.Right - 3, (thumbR.Top + thumbR.Bottom) div 2);
     C.Line(thumbR.Left + 3, (thumbR.Top + thumbR.Bottom) div 2 + 2, thumbR.Right - 3, (thumbR.Top + thumbR.Bottom) div 2 + 2);
 
-    // 6B. Right Sidebar: Track Information Inspector (Only shown when showRightSide is True!)
+    // 6B. Right Sidebar: Track Information / Synchronized Lyrics Inspector (Only shown when showRightSide is True!)
     if showRightSide then
     begin
       C.Brush.Style := bsSolid;
       C.Brush.Color := TColor($ECECEC);
       C.FillRect(rightPaneR);
 
+      FRectRightHeader := Rect(rightPaneR.Left, rightPaneR.Top, rightPaneR.Right, rightPaneR.Top + 20);
       C.Brush.Color := clBlack;
-      C.FillRect(rightPaneR.Left, rightPaneR.Top, rightPaneR.Right, rightPaneR.Top + 20);
+      C.FillRect(FRectRightHeader);
       C.Font.Size := 8;
       C.Font.Color := clWhite;
       C.Font.Style := [fsBold];
       C.Brush.Style := bsClear;
-      C.TextOut(rightPaneR.Left + 8, rightPaneR.Top + ((20 - C.TextHeight('Ag')) div 2) - 1, 'Track Information');
+      if not FLyricsMode then
+        C.TextOut(rightPaneR.Left + 8, rightPaneR.Top + ((20 - C.TextHeight('Ag')) div 2) - 1, 'Track Information')
+      else
+        C.TextOut(rightPaneR.Left + 8, rightPaneR.Top + ((20 - C.TextHeight('Ag')) div 2) - 1, 'Synchronized Lyrics');
+
+      // Classic Mac Header Mode Toggle Pill ([ ♪ Lyrics ] / [ ℹ Details ])
+      thumbR := Rect(rightPaneR.Right - 72, rightPaneR.Top + 2, rightPaneR.Right - 4, rightPaneR.Top + 18);
+      C.Brush.Style := bsSolid;
+      C.Brush.Color := TColor($333333);
+      C.Pen.Color := TColor($BBBBBB);
+      C.Rectangle(thumbR);
+      C.Brush.Style := bsClear;
+      C.Font.Size := 7;
+      C.Font.Style := [fsBold];
+      C.Font.Color := TColor($CCFFDD);
+      if not FLyricsMode then
+        headerStr := '♪ Lyrics'
+      else
+        headerStr := 'ℹ Details';
+      C.TextOut(thumbR.Left + ((thumbR.Width - C.TextWidth(headerStr)) div 2),
+                thumbR.Top + ((thumbR.Height - C.TextHeight('Ag')) div 2) - 1, headerStr);
+      C.Font.Size := 8;
 
       if (FSelectedRowIndex >= 0) and (FSelectedRowIndex < FTotalTracks) then
         GetTrackDetailsAtRow(FSelectedRowIndex, infoTID, infoTitle, infoArtist, infoAlbum, infoTime, infoFmt, infoPath, infoYear, infoTrackNo, infoBitrate, infoDurMs)
       else
         GetTrackDetailsAtRow(0, infoTID, infoTitle, infoArtist, infoAlbum, infoTime, infoFmt, infoPath, infoYear, infoTrackNo, infoBitrate, infoDurMs);
 
+      if (infoPath = '') and (FPShm <> nil) then
+        infoPath := StrPas(@FPShm^.VirtualURI[0]);
+
+      EnsureCoverThumbLoaded(infoPath);
       DrawVinylDiscIcon(C, rightPaneR.Left + 10, rightPaneR.Top + 28, (FPlayState = OMM_STATE_PLAYING) and (infoTID = FCurrentTrackID));
       C.Font.Color := clBlack;
       C.Font.Style := [fsBold];
@@ -2519,69 +3093,173 @@ begin
         C.TextOut(rightPaneR.Left + 62, rightPaneR.Top + 30, Format('SELECTED TRACK (#%d)', [IfThen(infoTID > 10000, Integer(infoTID) - 10000, Integer(infoTID))]));
 
       C.Font.Style := [];
-      C.TextOut(rightPaneR.Left + 62, rightPaneR.Top + 48,
-        FitTextToWidth(C, Format('%s · %d kbps · %d Hz', [infoFmt, infoBitrate, FSampleRate]), rightPaneR.Width - 68));
+      if FLyricsMode and (FTitleStr <> '') then
+        C.TextOut(rightPaneR.Left + 62, rightPaneR.Top + 48,
+          FitTextToWidth(C, FTitleStr + ' — ' + FArtistStr, rightPaneR.Width - 68))
+      else
+        C.TextOut(rightPaneR.Left + 62, rightPaneR.Top + 48,
+          FitTextToWidth(C, Format('%s · %d kbps · %d Hz', [infoFmt, infoBitrate, FSampleRate]), rightPaneR.Width - 68));
 
-      // Sunken Metadata Card with strict vertical bounds checking (Zero Overflow!)
+      // Sunken Metadata / Auto-Scrolling Lyrics Card with strict vertical bounds checking (Zero Overflow!)
       cardR := Rect(rightPaneR.Left + 8, rightPaneR.Top + 80, rightPaneR.Right - 8, rightPaneR.Bottom - 32);
+      FRectDetailsCard := cardR;
       if cardR.Bottom > cardR.Top + 24 then
       begin
         DrawMacSunkenPanel(C, cardR, clWhite);
-        y0 := cardR.Top + 8;
-        C.Brush.Style := bsClear;
 
-        if y0 + 32 <= cardR.Bottom - 4 then
+        if not FLyricsMode then
         begin
-          C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
-          C.TextOut(cardR.Left + 8, y0, 'Title:');
-          C.Font.Style := [fsBold]; C.Font.Color := clBlack;
-          C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, infoTitle, cardR.Width - 16));
-          Inc(y0, 38);
-        end;
+          y0 := cardR.Top + 8;
+          C.Brush.Style := bsClear;
 
-        if y0 + 32 <= cardR.Bottom - 4 then
-        begin
-          C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
-          C.TextOut(cardR.Left + 8, y0, 'Artist:');
-          C.Font.Style := []; C.Font.Color := clBlack;
-          C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, infoArtist, cardR.Width - 16));
-          Inc(y0, 38);
-        end;
+          if y0 + 32 <= cardR.Bottom - 4 then
+          begin
+            C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
+            C.TextOut(cardR.Left + 8, y0, 'Title:');
+            C.Font.Style := [fsBold]; C.Font.Color := clBlack;
+            C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, infoTitle, cardR.Width - 16));
+            Inc(y0, 38);
+          end;
 
-        if y0 + 32 <= cardR.Bottom - 4 then
-        begin
-          C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
-          C.TextOut(cardR.Left + 8, y0, 'Album:');
-          C.Font.Style := []; C.Font.Color := clBlack;
-          C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, infoAlbum, cardR.Width - 16));
-          Inc(y0, 38);
-        end;
+          if y0 + 32 <= cardR.Bottom - 4 then
+          begin
+            C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
+            C.TextOut(cardR.Left + 8, y0, 'Artist:');
+            C.Font.Style := []; C.Font.Color := clBlack;
+            C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, infoArtist, cardR.Width - 16));
+            Inc(y0, 38);
+          end;
 
-        if y0 + 32 <= cardR.Bottom - 4 then
-        begin
-          C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
-          C.TextOut(cardR.Left + 8, y0, 'Year / Track #:');
-          C.Font.Style := []; C.Font.Color := clBlack;
-          C.TextOut(cardR.Left + 8, y0 + 15, Format('%d   ·   Track #%d   (%s)', [infoYear, infoTrackNo, infoTime]));
-          Inc(y0, 38);
-        end;
+          if y0 + 32 <= cardR.Bottom - 4 then
+          begin
+            C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
+            C.TextOut(cardR.Left + 8, y0, 'Album:');
+            C.Font.Style := []; C.Font.Color := clBlack;
+            C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, infoAlbum, cardR.Width - 16));
+            Inc(y0, 38);
+          end;
 
-        if y0 + 32 <= cardR.Bottom - 4 then
-        begin
-          C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
-          C.TextOut(cardR.Left + 8, y0, 'Audio Specs:');
-          C.Font.Style := []; C.Font.Color := TColor($333333);
-          C.TextOut(cardR.Left + 8, y0 + 15,
-            FitTextToWidth(C, Format('%s · %d kbps · %d Hz / %d-Bit', [infoFmt, infoBitrate, FSampleRate, FBitDepth]), cardR.Width - 16));
-          Inc(y0, 38);
-        end;
+          if y0 + 32 <= cardR.Bottom - 4 then
+          begin
+            C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
+            C.TextOut(cardR.Left + 8, y0, 'Year / Track #:');
+            C.Font.Style := []; C.Font.Color := clBlack;
+            C.TextOut(cardR.Left + 8, y0 + 15, Format('%d   ·   Track #%d   (%s)', [infoYear, infoTrackNo, infoTime]));
+            Inc(y0, 38);
+          end;
 
-        if y0 + 32 <= cardR.Bottom - 4 then
+          if y0 + 32 <= cardR.Bottom - 4 then
+          begin
+            C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
+            C.TextOut(cardR.Left + 8, y0, 'Audio Specs:');
+            C.Font.Style := []; C.Font.Color := TColor($333333);
+            C.TextOut(cardR.Left + 8, y0 + 15,
+              FitTextToWidth(C, Format('%s · %d kbps · %d Hz / %d-Bit', [infoFmt, infoBitrate, FSampleRate, FBitDepth]), cardR.Width - 16));
+            Inc(y0, 38);
+          end;
+
+          if y0 + 32 <= cardR.Bottom - 4 then
+          begin
+            C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
+            C.TextOut(cardR.Left + 8, y0, 'Source File:');
+            C.Font.Style := []; C.Font.Color := TColor($333333);
+            C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, ExtractFileName(infoPath), cardR.Width - 16));
+          end;
+        end
+        else
         begin
-          C.Font.Style := [fsBold]; C.Font.Color := TColor($555555);
-          C.TextOut(cardR.Left + 8, y0, 'Source File:');
-          C.Font.Style := []; C.Font.Color := TColor($333333);
-          C.TextOut(cardR.Left + 8, y0 + 15, FitTextToWidth(C, ExtractFileName(infoPath), cardR.Width - 16));
+          // Auto-Scrolling Synchronized Lyrics View inside cardR (Top-anchored, center-scrolling)
+          if (FGuiLyricCount = 0) and (FPShm <> nil) and (FPShm^.LrcTextLen > 0) then
+          begin
+            FLastLrcGen := FPShm^.LrcGeneration;
+            ParseGuiLrcText(StrPas(@FPShm^.LrcRawText[0]));
+            UpdateActiveLyricLine(FPosMs, True);
+          end;
+
+          y1 := (cardR.Top + cardR.Bottom) div 2;
+          if FGuiLyricCount > 0 then
+          begin
+            for i := 0 to FGuiLyricCount - 1 do
+            begin
+              rowY := cardR.Top + 6 + Round(i * LYRIC_LINE_H - FLyricScrollY);
+              if (rowY < cardR.Top + 3) or (rowY + LYRIC_LINE_H > cardR.Bottom - 3) then
+                Continue;
+
+              if i = FActiveLyricIdx then
+              begin
+                rowR := Rect(cardR.Left + 3, rowY, cardR.Right - 7, rowY + LYRIC_LINE_H - 1);
+                C.Brush.Style := bsSolid;
+                C.Brush.Color := TColor($DCE8D0);
+                C.FillRect(rowR);
+                C.Brush.Color := TColor($244824);
+                C.FillRect(rowR.Left, rowR.Top, rowR.Left + 3, rowR.Bottom);
+
+                C.Brush.Style := bsClear;
+                C.Font.Size := 8;
+                C.Font.Style := [fsBold];
+                C.Font.Color := TColor($102010);
+                headerStr := FitTextToWidth(C, '♪ ' + FGuiLyrics[i].Text, cardR.Width - 20);
+                x0 := cardR.Left + Max(8, (cardR.Width - 6 - C.TextWidth(headerStr)) div 2);
+                C.TextOut(x0, rowY + ((LYRIC_LINE_H - C.TextHeight('Ag')) div 2) - 1, headerStr);
+              end
+              else
+              begin
+                C.Brush.Style := bsClear;
+                C.Font.Size := 8;
+                C.Font.Style := [];
+                if Abs(i - FActiveLyricIdx) = 1 then
+                  C.Font.Color := TColor($444444)
+                else if Abs(i - FActiveLyricIdx) = 2 then
+                  C.Font.Color := TColor($777777)
+                else
+                  C.Font.Color := TColor($9A9A9A);
+                headerStr := FitTextToWidth(C, FGuiLyrics[i].Text, cardR.Width - 20);
+                x0 := cardR.Left + Max(8, (cardR.Width - 6 - C.TextWidth(headerStr)) div 2);
+                C.TextOut(x0, rowY + ((LYRIC_LINE_H - C.TextHeight('Ag')) div 2) - 1, headerStr);
+              end;
+            end;
+
+            // Subtle progress indicator bar on right inner edge of cardR
+            trackAreaH := Max(16, cardR.Height - 8);
+            thumbH := Max(12, trackAreaH div Max(2, FGuiLyricCount));
+            thumbY := cardR.Top + 4 + Round((EnsureRange(FActiveLyricIdx, 0, Max(1, FGuiLyricCount - 1)) / Max(1, FGuiLyricCount - 1)) * (trackAreaH - thumbH));
+            C.Brush.Style := bsSolid;
+            C.Brush.Color := TColor($E8E8E8);
+            C.FillRect(cardR.Right - 5, cardR.Top + 3, cardR.Right - 2, cardR.Bottom - 3);
+            C.Brush.Color := TColor($6A886A);
+            C.FillRect(cardR.Right - 5, thumbY, cardR.Right - 2, thumbY + thumbH);
+          end
+          else if FLyricCurFallback <> '' then
+          begin
+            C.Brush.Style := bsClear;
+            C.Font.Size := 8;
+            C.Font.Style := [fsBold];
+            C.Font.Color := clBlack;
+            headerStr := FitTextToWidth(C, '♪ ' + FLyricCurFallback, cardR.Width - 16);
+            x0 := cardR.Left + Max(8, (cardR.Width - C.TextWidth(headerStr)) div 2);
+            C.TextOut(x0, cardR.Top + 16, headerStr);
+            if FLyricNextFallback <> '' then
+            begin
+              C.Font.Style := [];
+              C.Font.Color := TColor($666666);
+              headerStr := FitTextToWidth(C, FLyricNextFallback, cardR.Width - 16);
+              x0 := cardR.Left + Max(8, (cardR.Width - C.TextWidth(headerStr)) div 2);
+              C.TextOut(x0, cardR.Top + 40, headerStr);
+            end;
+          end
+          else
+          begin
+            C.Brush.Style := bsClear;
+            C.Font.Size := 8;
+            C.Font.Style := [fsBold];
+            C.Font.Color := TColor($555555);
+            headerStr := '♪ No Synchronized Lyrics';
+            C.TextOut(cardR.Left + Max(8, (cardR.Width - C.TextWidth(headerStr)) div 2), cardR.Top + 16, headerStr);
+            C.Font.Style := [];
+            C.Font.Color := TColor($888888);
+            headerStr := 'Play a track to load LRC lyrics';
+            C.TextOut(cardR.Left + Max(8, (cardR.Width - C.TextWidth(headerStr)) div 2), cardR.Top + 38, headerStr);
+          end;
         end;
       end;
 
@@ -2590,7 +3268,11 @@ begin
       DrawMacButton(C, FRectBtnSettings, '⚙ Mineral Login & Settings', FSettingsOpen, (FActivePressedBtn = 30) or FSettingsOpen);
     end
     else
+    begin
+      FRectRightHeader := Rect(0, 0, 0, 0);
+      FRectDetailsCard := Rect(0, 0, 0, 0);
       FRectBtnSettings := Rect(W - 88, H - 19, W - 18, H - 2);
+    end;
 
     FRectPluginWake   := Rect(0, 0, 0, 0);
     FRectPluginStream := Rect(0, 0, 0, 0);
@@ -2958,6 +3640,16 @@ begin
   begin
     FOscilloscopeMode := not FOscilloscopeMode;
   end
+  else if PtInRect(FRectRightHeader, pt) or PtInRect(FRectDetailsCard, pt) then
+  begin
+    FLyricsMode := not FLyricsMode;
+    if FLyricsMode then
+    begin
+      if (FGuiLyricCount = 0) and (FCurrentTrackID > 0) then
+        RequestOnlineLyricsForCurrentTrack;
+      UpdateActiveLyricLine(FPosMs, True);
+    end;
+  end
   else if PtInRect(FRectVolSlider, pt) then
   begin
     FIsDraggingVol := True;
@@ -3079,6 +3771,8 @@ begin
   if FIsDraggingSeek then
   begin
     FSeekRatio := EnsureRange((X - FRectSeekSlider.Left) / Max(1, FRectSeekSlider.Width), 0.0, 1.0);
+    if FLyricsMode and (FDurMs > 0) then
+      UpdateActiveLyricLine(Trunc(FSeekRatio * FDurMs), True);
     pbMac.Invalidate;
   end
   else if FIsDraggingVol then
@@ -3119,6 +3813,17 @@ end;
 procedure TMainForm.pbMacMouseWheel(Sender: TObject; Shift: TShiftState; WheelDelta: Integer; MousePos: TPoint; var Handled: Boolean);
 begin
   Handled := True;
+  if FLyricsMode and PtInRect(FRectDetailsCard, MousePos) and (FGuiLyricCount > 0) then
+  begin
+    FLyricManualScrollTick := GetTickCount64;
+    if WheelDelta > 0 then
+      FLyricTargetScrollY := Max(0.0, FLyricTargetScrollY - 2 * LYRIC_LINE_H)
+    else if WheelDelta < 0 then
+      FLyricTargetScrollY := Min(Single((FGuiLyricCount - 1) * LYRIC_LINE_H), FLyricTargetScrollY + 2 * LYRIC_LINE_H);
+    FLyricScrollY := FLyricTargetScrollY;
+    pbMac.Invalidate;
+    Exit;
+  end;
   if WheelDelta > 0 then ScrollToRow(FTopRowIndex - 4)
   else if WheelDelta < 0 then ScrollToRow(FTopRowIndex + 4);
 end;
@@ -3218,6 +3923,11 @@ begin
         hasResidual := True;
       end;
     end;
+    if FLyricsMode and (Abs(FLyricTargetScrollY - FLyricScrollY) > 0.3) then
+    begin
+      FLyricScrollY := FLyricScrollY + (FLyricTargetScrollY - FLyricScrollY) * 0.28;
+      hasResidual := True;
+    end;
     if hasResidual then pbMac.Invalidate;
     Exit;
   end;
@@ -3227,10 +3937,20 @@ begin
 
   repeat
     seq := SeqLockReadBegin(FPShm^.SeqLock);
+    FPosMs := FPShm^.PositionMs;
     Move(FPShm^.SpectrumMags[0], FLocalMags[0], SizeOf(FLocalMags));
     Move(FPShm^.SpectrumPeaks[0], FLocalPeaks[0], SizeOf(FLocalPeaks));
     Move(FPShm^.OscilloscopeTap[0], FLocalOsc[0], SizeOf(FLocalOsc));
   until not SeqLockReadRetry(FPShm^.SeqLock, seq);
+
+  if FLyricsMode and (FGuiLyricCount > 0) then
+  begin
+    UpdateActiveLyricLine(FPosMs, False);
+    if Abs(FLyricTargetScrollY - FLyricScrollY) > 0.3 then
+      FLyricScrollY := FLyricScrollY + (FLyricTargetScrollY - FLyricScrollY) * 0.28
+    else
+      FLyricScrollY := FLyricTargetScrollY;
+  end;
 
   pbMac.Invalidate;
 end;
@@ -3238,9 +3958,10 @@ end;
 procedure TMainForm.tmrStatusTimer(Sender: TObject);
 var
   seq: UInt64;
-  tTitle, tArtist, tAlbum: string;
+  tTitle, tArtist, tAlbum, rawLrc: string;
   vol: Single;
-  oldState, oldTrack, oldPosSec, oldPlugin: UInt32;
+  oldState, oldTrack, oldPosSec, oldPlugin, lrcGen: UInt32;
+  oldLyricIdx: Integer;
   pRec: POMMTrackRecord;
   r: Integer;
   nowTick: Int64;
@@ -3280,6 +4001,7 @@ begin
           FOscilloscopeMode := (Strings[4] = '1');
         FSourceMenuOpen := (Count >= 6) and (Strings[5] = '1');
         FSettingsOpen := (Count >= 6) and ((Strings[5] = '2') or (Strings[5] = '3') or (Strings[5] = '4') or (Strings[5] = '5'));
+        FLyricsMode := (Count >= 6) and (Strings[5] = '6');
         if FSettingsOpen then
         begin
           if Strings[5] = '4' then FSettingsTab := 2
@@ -3326,6 +4048,20 @@ begin
           FFilterText := Strings[2];
           RebuildFilteredList;
         end;
+        if FLyricsMode then
+        begin
+          if (FGuiLyricCount = 0) and (FCurrentTrackID > 0) then
+          begin
+            RequestOnlineLyricsForCurrentTrack;
+            Sleep(400);
+          end;
+          if FPShm <> nil then
+          begin
+            FLastLrcGen := FPShm^.LrcGeneration;
+            ParseGuiLrcText(StrPas(@FPShm^.LrcRawText[0]));
+            UpdateActiveLyricLine(FPShm^.PositionMs, True);
+          end;
+        end;
         pbMacPaint(Self);
         with TPortableNetworkGraphic.Create do
         try
@@ -3346,21 +4082,25 @@ begin
     if FPShm = nil then Exit;
   end;
 
-  oldState  := FPlayState;
-  oldTrack  := FCurrentTrackID;
-  oldPosSec := FPosMs div 500;
-  oldPlugin := FPluginState;
+  oldState    := FPlayState;
+  oldTrack    := FCurrentTrackID;
+  oldPosSec   := FPosMs div 500;
+  oldPlugin   := FPluginState;
+  oldLyricIdx := FActiveLyricIdx;
 
   repeat
     seq := SeqLockReadBegin(FPShm^.SeqLock);
-    FPlayFlags      := FPShm^.PlaybackFlags;
-    vol             := FPShm^.Volume;
-    FPluginState    := FPShm^.PluginState;
-    FPluginIdleSecs := FPShm^.PluginIdleSecs;
-    FPluginRssBytes := FPShm^.PluginRssBytes;
-    FSampleRate     := FPShm^.SampleRate;
-    FChannels       := FPShm^.Channels;
-    FBitDepth       := FPShm^.BitDepth;
+    FPlayFlags         := FPShm^.PlaybackFlags;
+    vol                := FPShm^.Volume;
+    FPluginState       := FPShm^.PluginState;
+    FPluginIdleSecs    := FPShm^.PluginIdleSecs;
+    FPluginRssBytes    := FPShm^.PluginRssBytes;
+    FSampleRate        := FPShm^.SampleRate;
+    FChannels          := FPShm^.Channels;
+    FBitDepth          := FPShm^.BitDepth;
+    lrcGen             := FPShm^.LrcGeneration;
+    FLyricCurFallback  := StrPas(@FPShm^.LyricCurrent[0]);
+    FLyricNextFallback := StrPas(@FPShm^.LyricNext[0]);
     if (FLastSyncedTrackID > 0) and (FPShm^.CurrentTrackID <> FLastSyncedTrackID) and
        (GetTickCount64 - FLastRowClickTick < 3500) then
     begin
@@ -3380,6 +4120,23 @@ begin
       tAlbum          := StrPas(@FPShm^.TrackAlbum[0]);
     end;
   until not SeqLockReadRetry(FPShm^.SeqLock, seq);
+
+  if lrcGen <> FLastLrcGen then
+  begin
+    FLastLrcGen := lrcGen;
+    rawLrc := '';
+    repeat
+      seq := SeqLockReadBegin(FPShm^.SeqLock);
+      rawLrc := StrPas(@FPShm^.LrcRawText[0]);
+    until not SeqLockReadRetry(FPShm^.SeqLock, seq);
+    ParseGuiLrcText(rawLrc);
+    UpdateActiveLyricLine(FPosMs, True);
+    if FLyricsMode and (FGuiLyricCount = 0) and (FCurrentTrackID > 0) then
+      RequestOnlineLyricsForCurrentTrack;
+    pbMac.Invalidate;
+  end
+  else if FGuiLyricCount > 0 then
+    UpdateActiveLyricLine(FPosMs, False);
 
   if not FIsDraggingVol then
     FVolume := SanitizeSingle(vol, 0.0, 1.0, 1.0);
@@ -3444,7 +4201,8 @@ begin
   end;
 
   if (oldState <> FPlayState) or (oldTrack <> FCurrentTrackID) or
-     (oldPosSec <> (FPosMs div 500)) or (oldPlugin <> FPluginState) then
+     (oldPosSec <> (FPosMs div 500)) or (oldPlugin <> FPluginState) or
+     (oldLyricIdx <> FActiveLyricIdx) then
     pbMac.Invalidate;
 end;
 
