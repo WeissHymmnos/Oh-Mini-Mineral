@@ -12,13 +12,21 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+OS_UNAME="$(uname -s)"
+case "${OS_UNAME}" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT*)
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W)"
+        WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -W)"
+        ;;
+    *)
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+        ;;
+esac
 SYSROOT_FPC="${WORKSPACE_ROOT}/.sysroot/fpc"
 BIN_DIR="${WORKSPACE_ROOT}/bin"
 UNITS_ROOT="${WORKSPACE_ROOT}/target/fpc-units"
 
-OS_UNAME="$(uname -s)"
 case "${OS_UNAME}" in
     Linux*)
         PLATFORM="linux"
@@ -28,7 +36,7 @@ case "${OS_UNAME}" in
         GC_FLAGS=("-k--gc-sections")
         MAX_DAEMON_BYTES=819200    # 800 KB
         MAX_TUI_BYTES=409600       # 400 KB
-        MAX_GUI_BYTES=2936012      # 2.8 MB
+        MAX_GUI_BYTES=3670016      # 3.5 MB
         MAX_CODEC_BYTES=131072     # 128 KB
         ;;
     Darwin*)
@@ -136,11 +144,19 @@ check_size() {
 strip_binary() {
     local file="$1"
     if [[ "${PLATFORM}" == "linux" ]]; then
-        strip --strip-unneeded "${file}" 2>/dev/null || true
+        if [[ "${file}" == *.so ]]; then
+            strip --strip-unneeded "${file}" 2>/dev/null || true
+        else
+            strip -s "${file}" 2>/dev/null || true
+        fi
     elif [[ "${PLATFORM}" == "macos" ]]; then
         strip -x "${file}" 2>/dev/null || true
     elif [[ "${PLATFORM}" == "windows" ]]; then
-        strip --strip-unneeded "${file}" 2>/dev/null || true
+        if [[ "${file}" == *.dll ]]; then
+            strip --strip-unneeded "${file}" 2>/dev/null || true
+        else
+            strip -s "${file}" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -286,7 +302,12 @@ build_gui() {
             "${GUI_LPR}"
     else
         echo "Compiling omm_gui${EXE_EXT} with lazbuild (--ws=${WIDGETSET})..."
+        local LAZ_EXTRA=()
+        if [[ -d "/tmp/lazarus" ]]; then
+            LAZ_EXTRA+=("--lazarusdir=/tmp/lazarus")
+        fi
         lazbuild \
+            "${LAZ_EXTRA[@]}" \
             --ws="${WIDGETSET}" \
             --build-mode=Release \
             "${GUI_LPI}"

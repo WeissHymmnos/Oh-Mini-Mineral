@@ -72,19 +72,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Free Pascal & Lazarus
-        uses: gcarreno/setup-lazarus@v3
-        with:
-          lazarus-version: "dist"
-
-      - name: Prepare macOS Lazarus environment
+      - name: Install Free Pascal & Lazarus (macOS Cocoa)
         run: |
-          if [ -d /Applications/Lazarus ]; then
-            sudo chown -R "$(whoami)" /Applications/Lazarus || true
-          fi
-          if [ "$(uname -m)" = "arm64" ]; then
-            /usr/sbin/softwareupdate --install-rosetta --agree-to-license || true
-          fi
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install fpc
+          curl -sL "https://gitlab.com/freepascal.org/lazarus/lazarus/-/archive/lazarus_3_6/lazarus-lazarus_3_6.tar.gz" | tar -xz -C /tmp
+          rm -rf /tmp/lazarus
+          mv /tmp/lazarus-lazarus_3_6 /tmp/lazarus
+          make -C /tmp/lazarus lazbuild lcl LCL_PLATFORM=cocoa
+          ln -sf /tmp/lazarus/lazbuild "$(brew --prefix)/bin/lazbuild"
+          mkdir -p "$HOME/.lazarus"
+          cat > "$HOME/.lazarus/environmentoptions.xml" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <CONFIG>
+            <EnvironmentOptions>
+              <LazarusDirectory Value="/tmp/lazarus"/>
+              <CompilerFilename Value="$(command -v fpc)"/>
+            </EnvironmentOptions>
+          </CONFIG>
+          EOF
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable

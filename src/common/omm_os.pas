@@ -654,7 +654,8 @@ begin
   if pid <= 0 then Exit(-1);
   if sig = 0 then
   begin
-    hProc := OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, DWORD(pid));
+    hProc := OpenProcess($1000 {PROCESS_QUERY_LIMITED_INFORMATION}, False, DWORD(pid));
+    if hProc = 0 then hProc := OpenProcess(PROCESS_QUERY_INFORMATION, False, DWORD(pid));
     if hProc = 0 then hProc := OpenProcess(SYNCHRONIZE, False, DWORD(pid));
     if hProc = 0 then Exit(-1);
     exitCode := 0;
